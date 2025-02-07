@@ -27,10 +27,11 @@ set(FAISS_SRC
   IndexIVFFlat.cpp
   IndexIVFPQ.cpp
   IndexIVFPQDisk.cpp
+  IndexIVFPQDisk2.cpp
   IndexIVFFastScan.cpp
-  IndexIVFPQFastScanDisk.cpp
   IndexIVFAdditiveQuantizerFastScan.cpp
   IndexIVFPQFastScan.cpp
+  IndexIVFPQFastScanDisk.cpp
   IndexIVFPQR.cpp
   IndexIVFSpectralHash.cpp
   IndexLSH.cpp
@@ -42,7 +43,6 @@ set(FAISS_SRC
   IndexAdditiveQuantizerFastScan.cpp
   IndexIVFIndependentQuantizer.cpp
   IndexPQFastScan.cpp
-  IndexIVFPQFastScan.cpp
   IndexPreTransform.cpp
   IndexRefine.cpp
   IndexReplicas.cpp
@@ -57,7 +57,10 @@ set(FAISS_SRC
   clone_index.cpp
   index_factory.cpp
   impl/AuxIndexStructures.cpp
+  impl/AsyncIOExtension.cpp
   impl/CodePacker.cpp
+  impl/DiskInvertedListHolder.cpp
+  impl/DiskIOProcessor.cpp
   impl/IDSelector.cpp
   impl/FaissException.cpp
   impl/HNSW.cpp
@@ -115,6 +118,7 @@ set(FAISS_HEADERS
   IndexBinaryHNSW.h
   IndexBinaryHash.h
   IndexBinaryIVF.h
+  IndexDisk.h
   IndexFlat.h
   IndexFlatCodes.h
   IndexHNSW.h
@@ -122,13 +126,14 @@ set(FAISS_HEADERS
   IndexIVF.h
   IndexIVFAdditiveQuantizer.h
   IndexIVFIndependentQuantizer.h
-  IndexDisk.h
   IndexIVFFlat.h
   IndexIVFPQ.h
   IndexIVFPQDisk.h
+  IndexIVFPQDisk2.h
   IndexIVFFastScan.h
   IndexIVFAdditiveQuantizerFastScan.h
   IndexIVFPQFastScan.h
+  IndexIVFPQFastScanDisk.h
   IndexIVFPQR.h
   IndexIVFSpectralHash.h
   IndexLSH.h
@@ -154,8 +159,12 @@ set(FAISS_HEADERS
   index_factory.h
   index_io.h
   impl/AdditiveQuantizer.h
+  impl/AsyncIOExtension.h
   impl/AuxIndexStructures.h
   impl/CodePacker.h
+  impl/DiskInvertedListHolder.h
+  impl/DiskIOProcessor.h
+  impl/DiskIOStructure.h
   impl/IDSelector.h
   impl/DistanceComputer.h
   impl/FaissAssert.h
@@ -272,13 +281,19 @@ endif()
 
 # Handle `#include <faiss/foo.h>`.
 target_include_directories(faiss PUBLIC
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/tsl>
+  )
 # Handle `#include <faiss/foo.h>`.
 target_include_directories(faiss_avx2 PUBLIC
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/tsl>
+  )
 # Handle `#include <faiss/foo.h>`.
 target_include_directories(faiss_avx512 PUBLIC
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>)
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}>
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/tsl>
+  )
 
 set_target_properties(faiss PROPERTIES
   POSITION_INDEPENDENT_CODE ON

@@ -67,11 +67,11 @@ int main() {
     int d = 128;      // dimension
     int nb = 1000000; // database size
     int nq = 100;   // nb of queries
-
-        const char* base_filepath = "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_base.fvecs";
-    const char* query_filepath = "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_query.fvecs";
-    const char* ground_truth_filepath =  "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_groundtruth.ivecs";
-        char* disk_path ="/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_base.fvecs";
+    char* base_filepath ="/mnt/d/VectorDB/sift/sift/sift_base.fvecs";
+    char* query_filepath ="/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
+    char* ground_truth_filepath="/mnt/d/VectorDB/sift/sift/sift_groundtruth.ivecs";
+    char* disk_path ="/home/granthe/data/sift1M/sift_base.fvecs";
+    
     //std::string index_store_path  = "/home/granthe/faiss/faiss/build/sift1M";
     //std::string result_path       = "/mnt/d/VectorDB/RESULT_SET/ivf_pq_disk_wsl.txt";
 
@@ -116,7 +116,7 @@ int main() {
         faiss::IndexDisk index_disk(d, disk_path);
         // IndexRefineFlat
         faiss::IndexRefine index(&index_pq, &index_disk);
-        index.k_factor = 5;
+        index.k_factor = 3;
         
         printf("[%.3f s] IndexRefine start to train\n", elapsed() - t0);
         index.train(nb / ratio, trainvecs.data());
@@ -143,7 +143,7 @@ int main() {
             //int arr[] = {4, 5, 6, 7, 8, 10};
             //int arr[] = {5, 7, 9, 11, 13};
             //int arr[] = {5,10,15,20,25,30};
-            int arr[] = {30,50,70,90, 120};
+            int arr[] = {90};
             //int arr[] = { 90,100,120, 140};
 
             // write_index(index, "hnsw.index");
@@ -183,7 +183,7 @@ int main() {
                 }
                 printf("Intersection R@100 = %.4f\n", n2_100 / float(nq * k));
                 double recall = n2_100 / float(nq * k);
-                search_times.push_back((search_time / nq) * 1000);  // per-query time in milliseconds
+                search_times.push_back(search_time/nq*1000);
                 recalls.push_back(recall);
             }
 

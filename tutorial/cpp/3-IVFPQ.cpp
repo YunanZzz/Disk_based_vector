@@ -68,15 +68,14 @@ int main() {
     int d = 128;      // dimension
     int nb = 1000000; // database size
     int nq = 10000;   // nb of queries
-    char* base_filepath =
-            "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_base.fvecs";
-    char* query_filepath =
-            "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_query.fvecs";
+    char* base_filepath = "/mnt/d/VectorDB/sift/sift/sift_base.fvecs";
+    char* query_filepath = "/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
+    char* groundtruth_filepath = "/mnt/d/VectorDB/sift/sift/sift_groundtruth.ivecs";
     size_t dd; // dimension
     size_t nt; // the number of vectors
     float* xb = new float[d * nb];
     float* xq = new float[d * nq];
-omp_set_num_threads(16);
+
     size_t dd2; // dimension
     size_t nt2; // the number of query
     xb = fvecs_read(base_filepath, &dd, &nt);
@@ -101,7 +100,7 @@ omp_set_num_threads(16);
         size_t nq2;
         size_t kk;
         int* gt_int = ivecs_read(
-                "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_groundtruth.ivecs",
+                groundtruth_filepath,
                 &kk,
                 &nq2);
         faiss::IndexFlatL2 coarse_quantizer(d);
@@ -109,9 +108,8 @@ omp_set_num_threads(16);
         // faiss::Index* index;
         // index= faiss::index_factory(128, "IVF1024,PQ64x4fs");
         // faiss::IndexPQFastScan index(d,64,4,faiss::METRIC_L2);
-        // faiss::IndexIVFPQFastScan index(
-        //         &coarse_quantizer, 128, 1000, 64, 4, faiss::METRIC_L2);
-            faiss::IndexIVFPQ index(&coarse_quantizer, d, nlist, 16, 8);
+        faiss::IndexIVFPQFastScan index(
+                &coarse_quantizer, 128, 1000, 64, 4, faiss::METRIC_L2);
         faiss::IndexRefineFlat newindex(&index);
         newindex.k_factor = 5;
         // faiss::Index * index1 = faiss::read_index("large.index");
@@ -128,6 +126,7 @@ omp_set_num_threads(16);
         printf("[%.3f s] IndexIVFPQFastScan add finished\n", elapsed() - t0);
         std::vector<double> search_times;
         std::vector<double> recalls;
+        //omp_set_num_threads(1);
         { // search xq
 
             idx_t* I = new idx_t[k * nq];
@@ -144,7 +143,7 @@ omp_set_num_threads(16);
             //         printf("%5zd ", I[i * k + j]);
             //     printf("\n");
             // }
-            int arr[] = {5, 7, 10, 20, 30, 40};
+            int arr[] = {5, 7, 10, 20, 30, 40, 50, 60};
 
             // write_index(index, "hnsw.index");
             // how to get length of array
@@ -201,6 +200,15 @@ omp_set_num_threads(16);
         for (size_t i = 0; i < search_times.size(); i++) {
             std::cout << search_times[i];
             if (i < search_times.size() - 1) {
+                std::cout << ", ";
+            }
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "QPS: [";
+        for (size_t i = 0; i < recalls.size(); i++) {
+            std::cout << 1000.0/search_times[i];
+            if (i < recalls.size() - 1) {
                 std::cout << ", ";
             }
         }

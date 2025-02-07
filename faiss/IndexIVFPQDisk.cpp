@@ -6,37 +6,43 @@
 #include <mutex>
 
 #include <algorithm>
+#include <map>
 #include <cinttypes>
 #include <cstdio>
 #include <limits>
 
-#include <fcntl.h> // 包含 open 函数和相关的文件控制常量（如 O_RDONLY 等）
-#include <sys/mman.h>
-#include <sys/stat.h>  // 包含 open 相关的模式常量
-#include <sys/types.h> // 包含 ssize_t 类型
-#include <unistd.h>    // 包含 read, lseek 函数
-#include <cerrno>      // 包含 errno 及其处理
 #include <fstream>
-#include <stdexcept> // 包含 std::runtime_error
+#include <unistd.h>   // 包含 read, lseek 函数
+#include <fcntl.h>    // 包含 open 函数和相关的文件控制常量（如 O_RDONLY 等）
+#include <sys/types.h> // 包含 ssize_t 类型
+#include <sys/stat.h>  // 包含 open 相关的模式常量
+#include <cerrno>      // 包含 errno 及其处理
+#include <stdexcept>   // 包含 std::runtime_error
+#include <sys/mman.h>
 
 #include <faiss/utils/Heap.h>
-#include <faiss/utils/distances.h>
 #include <faiss/utils/hamming.h>
+#include <faiss/utils/distances.h>
 #include <faiss/utils/utils.h>
-// #include <faiss/tsl/robin_set.h>
-// #include <unordered_set>
+#include <faiss/index_io.h>
+//#include <faiss/tsl/robin_set.h>
+//#include <unordered_set>
 
 #include <faiss/IndexFlat.h>
 #include <faiss/impl/AuxIndexStructures.h>
 #include <faiss/impl/CodePacker.h>
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/IDSelector.h>
+#include <faiss/impl/DiskIOProcessor.h>
 
 #include <faiss/impl/code_distance/code_distance.h>
 
 #include <iostream>
 
-namespace faiss {
+#define USING_ASYNC
+//#define USING SYNC
+
+namespace faiss{
 
 IndexIVFPQDisk::IndexIVFPQDisk(
         Index* quantizer,
@@ -48,16 +54,28 @@ IndexIVFPQDisk::IndexIVFPQDisk(
         float estimate_factor,
         float prune_factor,
         const std::string& diskPath,
-        MetricType metric)
-        : IndexIVFPQ(quantizer, d, nlist, M, nbits_per_idx, metric),
-          top(top),
-          estimate_factor(estimate_factor),
-          prune_factor(prune_factor),
-          disk_path(diskPath),
-          disk_vector_offset(d * sizeof(float)) {
+        const std::string& valueType,
+        MetricType metric): 
+    IndexIVFPQ(quantizer, d, nlist, M, nbits_per_idx, metric), 
+                top(top), 
+                estimate_factor(estimate_factor), 
+                prune_factor(prune_factor), 
+                disk_path(diskPath),
+                disk_vector_offset(d * sizeof(float)),
+                valueType(valueType) {
     estimate_factor_partial = estimate_factor;
-    // clusters = new size_t[nlist];
-    // len = new size_t[nlist];
+    //this->code_size = d * sizeof(float);  // code_size refer to vectors stored in disk.
+    //clusters = new size_t[nlist];
+    //len = new size_t[nlist];
+    std::cout << valueType << " " << this->valueType << std::endl;
+    if(valueType!="float" && valueType!= "uint8" && valueType!= "int16"){
+       
+        FAISS_THROW_FMT("Unsupported type %s", valueType.c_str());
+    }
+
+    //FAISS_ASSERT_MSG(valueType!="float" && valueType!= "uint8" && valueType!= "int16", "Unsupported value type");
+    
+    this->aligned_cluster_info = nullptr;
     clusters = nullptr;
     len = nullptr;
 }
@@ -65,40 +83,50 @@ IndexIVFPQDisk::IndexIVFPQDisk(
 IndexIVFPQDisk::IndexIVFPQDisk() {}
 
 IndexIVFPQDisk::~IndexIVFPQDisk() {
-    if (clusters != nullptr)
+    if(clusters != nullptr)
         delete[] clusters;
-    if (len != nullptr)
+    if(len != nullptr)
         delete[] len;
-    if (centroid_index) {
-        delete centroid_index;
-    }
-}
-void IndexIVFPQDisk::adjustReplica(idx_t n, idx_t k, idx_t* label, float* distances)
-        const {
-            int count=0;
-#pragma omp parallel for
-    for (size_t i = 0; i < n; i++) {
-        float tmp = distances[i * k]; // Start with the first distance in the row
-
-        for (size_t j = 1; j < k; j++) { // Start j from 1 to skip the first element
-            // replicas_control: parameter that control assignment
-            // see index.h
-            if (tmp * replicas_control > distances[i * k + j]) {
-                tmp = distances[i * k + j];
-            } else {
-                for (size_t l = j; l < k; l++) {
-                    label[i * k + l] = -1; // Assign -1 to label
-                    count++;
-                }
-                break;
-            }
-        }
-    }
-    printf("n=%d, k= %d, count=%d\n",n, k,  count);
+    if(aligned_cluster_info!=nullptr)
+        delete[] aligned_cluster_info;
 }
 
+void IndexIVFPQDisk::train_graph(){
+    std::cout << "The index is of type Disk.\n";
+    IndexFlat* flat_quantizer = dynamic_cast<IndexFlat*>(quantizer);
+    if (flat_quantizer != nullptr) {
+        faiss::IndexHNSWFlat index(d, 16);
+        index.add(quantizer->ntotal, flat_quantizer->get_xb()); 
+        faiss::write_index(&index, this->centroid_index_path.c_str());
+        std::cout << "Output centroid index.\n";
+        load_hnsw_centroid_index();
+    } else {
+        // Handle the case where quantizer is not of type IndexFlat
+        std::cerr << "Quantizer is not an IndexFlat." << std::endl;
+    }
+}
 
-// Function to calculate the dot product of two vectors
+void IndexIVFPQDisk::load_hnsw_centroid_index(){
+    if (centroid_index_path.empty()) {
+        throw std::runtime_error("Centroid index path is not set.");
+    }
+    // Load the HNSW index from the specified path
+    faiss::Index* loaded_index = faiss::read_index(centroid_index_path.c_str());
+
+    // Attempt to cast the loaded index to faiss::IndexHNSW
+    centroid_index = dynamic_cast<faiss::IndexHNSWFlat*>(loaded_index);
+
+    if (centroid_index == nullptr) {
+        throw std::runtime_error("Failed to cast the loaded index to faiss::IndexHNSW.");
+    }
+
+    std::cout << "HNSW centroid index loaded successfully from " << centroid_index_path << std::endl;
+    
+}
+
+namespace{
+
+    // Function to calculate the dot product of two vectors
 double dotProduct(const std::vector<double>& vec1, const std::vector<double>& vec2, size_t d) {
     double dot = 0.0;
     for (size_t i = 0; i < d; i++) {
@@ -178,7 +206,7 @@ void SOAR(const float* xb, const float* centroidData,
             double cosineSimilarity = dotProduct(primaryResidual, currentResidual, d) / 
                                       (primaryResidualNorm * currentResidualNorm);
 
-            if (std::abs(cosineSimilarity) < std::abs(minCosineSimilarity)) {
+            if (cosineSimilarity < minCosineSimilarity) {
                 minCosineSimilarity = cosineSimilarity;
                 secondaryCentroidIdx = i;
             }
@@ -190,24 +218,22 @@ void SOAR(const float* xb, const float* centroidData,
         assign[2 * vecIdx + 1] = coarse_idx[vecIdx * k + secondaryCentroidIdx];
     }
 }
+}
 
-// void IndexIVFPQDisk::add_with_ids(idx_t n, const float* x, const idx_t* xids) {
+
+// void IndexIVFPQDisk::add_with_ids(idx_t n, const float* x, const idx_t* xids){
 //     idx_t k = this->assign_replicas;
 //     std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n * k]);
-//     printf("IndexIVFPQDisk::add_with_ids::k=%d\n",k);
-//     float* D = new float[k * n];
-//     if (n * k < 100000) {
+   
+//     if(centroid_index != nullptr && n*k > 10000){
+//         std::cout << "Using hnsw centroid assign\n";
+//         centroid_index->hnsw.efSearch = k * 4/3;
+//         centroid_index->assign(n, x, coarse_idx.get(), k);
+//     }else{
+//          std::cout << "Using quantizer assign\n";
 //         quantizer->assign(n, x, coarse_idx.get(), k);
-//     } else {
-//         printf("IndexIVFPQDisk::add_with_ids::hnsw way, n=%ld, k=%ld \n", n, k);
-       
-//         centroid_index->hnsw.efSearch = 400;
-//         centroid_index->search(n, x, k, D, coarse_idx.get());
-//         // quantizer->assign(n, x, coarse_idx.get(), k);
 //     }
-//     if (k != 1) {
-//         adjustReplica(n, k, coarse_idx.get(), D);
-//     }
+
 //     add_core(n, x, xids, coarse_idx.get());
 // }
 
@@ -227,20 +253,19 @@ void IndexIVFPQDisk::add_with_ids(idx_t n, const float* x, const idx_t* xids) {
         // quantizer->assign(n, x, coarse_idx.get(), k);
     }
     if (k != 1) {
-    printf("Using SOAR\n");
-    std::unique_ptr<idx_t[]> assign(new idx_t[n * 2]);
-    IndexFlat* flat_quantizer = dynamic_cast<IndexFlat*>(quantizer);
-    float* centroidData = flat_quantizer->get_xb();
-    SOAR(x, centroidData, coarse_idx.get(), assign.get(), n, d, k);
-    add_core(n, x, xids, assign.get());
-    return;
+        printf("Using SOAR\n");
+        std::unique_ptr<idx_t[]> assign(new idx_t[n * 2]);
+        IndexFlat* flat_quantizer = dynamic_cast<IndexFlat*>(quantizer);
+        float* centroidData = flat_quantizer->get_xb();
+        SOAR(x, centroidData, coarse_idx.get(), assign.get(), n, d, k);
+        add_core(n, x, xids, assign.get());
+        return;
     }
     //     if (k != 1) {
     //     adjustReplica(n, k, coarse_idx.get(), D);
     // }
     add_core(n, x, xids, coarse_idx.get());
 }
-
 
 void IndexIVFPQDisk::add_core(
         idx_t n,
@@ -258,8 +283,7 @@ void IndexIVFPQDisk::initial_location(idx_t n, const float* data) {
     }
 
     // Cast invlists to ArrayInvertedLists to access the underlying data
-    ArrayInvertedLists* array_invlists =
-            dynamic_cast<ArrayInvertedLists*>(invlists);
+    ArrayInvertedLists* array_invlists = dynamic_cast<ArrayInvertedLists*>(invlists);
     if (!array_invlists) {
         throw std::runtime_error("invlists is not of type ArrayInvertedLists.");
     }
@@ -267,39 +291,51 @@ void IndexIVFPQDisk::initial_location(idx_t n, const float* data) {
     size_t* tmp_clusters = nullptr;
     size_t* tmp_len = nullptr;
     // the first time to add
-    if (clusters == nullptr && len == nullptr) {
+    if(clusters == nullptr && len == nullptr){
+        this->aligned_cluster_info = new Aligned_Cluster_Info[nlist];
         clusters = new size_t[nlist];
         len = new size_t[nlist];
-    } else {
+    }else{
         tmp_clusters = new size_t[nlist];
         tmp_len = new size_t[nlist];
-        for (size_t i = 0; i < nlist; ++i) {
+        for(size_t i = 0; i < nlist; ++i){
             tmp_clusters[i] = clusters[i];
             tmp_len[i] = len[i];
         }
     }
-
+    
     size_t current_offset = 0;
     for (size_t i = 0; i < nlist; ++i) {
         clusters[i] = current_offset;
         len[i] = array_invlists->ids[i].size();
         current_offset += len[i];
     }
-    if (verbose) {
+    if(verbose){
         printf("Cluster info initialized!");
     }
+
+    std::unique_ptr<DiskIOProcessor> io_processor(get_DiskIOBuildProcessor());
+    //get_DiskIOBuildProcessor();
     // reorg it at last, and save it to file.
-    reorganize_vectors(n, data, tmp_clusters, tmp_len);
+    
+    //reorganize_vectors(n, data, tmp_clusters ,tmp_len);
+    if(io_processor->reorganize_vectors(n, 
+                                    data, 
+                                    tmp_clusters, 
+                                    tmp_len, 
+                                    clusters, 
+                                    len, 
+                                    aligned_cluster_info,
+                                    nlist, 
+                                    array_invlists->ids)){
+        this->disk_path = disk_path + ".clustered";
+    }
 }
 
 // Method to reorganize vectors based on clustering
-void IndexIVFPQDisk::reorganize_vectors(
-        idx_t n,
-        const float* data,
-        size_t* old_clusters,
-        size_t* old_len) {
-    ArrayInvertedLists* array_invlists =
-            dynamic_cast<ArrayInvertedLists*>(invlists);
+void IndexIVFPQDisk::reorganize_vectors(idx_t n, const float* data, size_t* old_clusters, size_t* old_len) {
+    
+    ArrayInvertedLists* array_invlists = dynamic_cast<ArrayInvertedLists*>(invlists);
     if (!array_invlists) {
         throw std::runtime_error("invlists is not of type ArrayInvertedLists.");
     }
@@ -308,20 +344,17 @@ void IndexIVFPQDisk::reorganize_vectors(
 
     if (old_clusters == nullptr && old_len == nullptr) {
         // Reorganize vectors and write to the new file
-        disk_path = disk_path;
+        //disk_path = disk_path + ".clustered";
 
-        // std::cout << "disk_path_clustered: " << disk_path_clustered <<
-        // std::endl; std::cout << "disk_path          : " << disk_path <<
-        // std::endl;
+        //std::cout << "disk_path_clustered: " << disk_path_clustered << std::endl;
+        //std::cout << "disk_path          : " << disk_path << std::endl;
         set_disk_write(disk_path);
         for (size_t i = 0; i < nlist; ++i) {
             size_t count = len[i];
             for (size_t j = 0; j < count; ++j) {
                 idx_t id = array_invlists->ids[i][j];
                 const float* vector = &data[id * d];
-                disk_data_write.write(
-                        reinterpret_cast<const char*>(vector),
-                        d * sizeof(float));
+                disk_data_write.write(reinterpret_cast<const char*>(vector), d * sizeof(float));
             }
         }
         disk_data_write.close();
@@ -329,20 +362,19 @@ void IndexIVFPQDisk::reorganize_vectors(
         std::string tmp_disk = disk_path + ".tmp";
         // 1. Rename disk_path_clustered to tmp_disk
         int file_result = std::rename(disk_path.c_str(), tmp_disk.c_str());
-        if (file_result == 0)
+        if(file_result == 0)
             std::cout << "Success rename: " << tmp_disk << std::endl;
         else
-            std::cout << "Fail: " << tmp_disk << std::endl;
+            std::cout << "Fail: "<< tmp_disk << std::endl;
         // 2. Open temp_disk for reading
         std::ifstream temp_disk_read(tmp_disk, std::ios::binary);
         if (!temp_disk_read.is_open()) {
-            throw std::runtime_error(
-                    "Failed to open temporary disk file for reading.");
+            throw std::runtime_error("Failed to open temporary disk file for reading.");
         }
 
         // 3. Set up for writing to the new clustered disk path
         set_disk_write(disk_path);
-
+        
         // 4. Write old data and new data to the file
         for (size_t i = 0; i < nlist; ++i) {
             size_t old_offset = old_clusters[i];
@@ -351,21 +383,15 @@ void IndexIVFPQDisk::reorganize_vectors(
             // Read old cluster data
             std::vector<float> old_cluster(old_count * d);
             temp_disk_read.seekg(old_offset * d * sizeof(float), std::ios::beg);
-            temp_disk_read.read(
-                    reinterpret_cast<char*>(old_cluster.data()),
-                    old_count * d * sizeof(float));
-            disk_data_write.write(
-                    reinterpret_cast<const char*>(old_cluster.data()),
-                    old_count * d * sizeof(float));
+            temp_disk_read.read(reinterpret_cast<char*>(old_cluster.data()), old_count * d * sizeof(float));
+            disk_data_write.write(reinterpret_cast<const char*>(old_cluster.data()), old_count * d * sizeof(float));
 
             // Write new data
             size_t count = len[i];
             for (size_t j = old_count; j < count; ++j) {
                 idx_t id = array_invlists->ids[i][j];
                 const float* vector = &data[(id - old_total) * d];
-                disk_data_write.write(
-                        reinterpret_cast<const char*>(vector),
-                        d * sizeof(float));
+                disk_data_write.write(reinterpret_cast<const char*>(vector), d * sizeof(float));
             }
         }
         disk_data_write.close();
@@ -388,8 +414,7 @@ void IndexIVFPQDisk::set_disk_read(const std::string& diskPath) {
     }
     disk_data_read.open(disk_path, std::ios::binary);
     if (!disk_data_read.is_open()) {
-        throw std::runtime_error(
-                "IndexIVFPQDisk: Failed to open disk file for reading");
+        throw std::runtime_error("IndexIVFPQDisk: Failed to open disk file for reading");
     }
 }
 
@@ -401,15 +426,11 @@ void IndexIVFPQDisk::set_disk_write(const std::string& diskPath) {
     }
     disk_data_write.open(disk_path, std::ios::binary);
     if (!disk_data_write.is_open()) {
-        throw std::runtime_error(
-                "IndexIVFPQDisk: Failed to open disk file for writing");
+        throw std::runtime_error("IndexIVFPQDisk: Failed to open disk file for writing");
     }
 }
 
-void IndexIVFPQDisk::load_from_offset(
-        size_t list_no,
-        size_t offset,
-        float* original_vector) {
+void IndexIVFPQDisk::load_from_offset(size_t list_no, size_t offset, float* original_vector) {
     if (!disk_data_read.is_open()) {
         throw std::runtime_error("Disk read stream is not open.");
     }
@@ -422,8 +443,7 @@ void IndexIVFPQDisk::load_from_offset(
     disk_data_read.seekg(global_offset, std::ios::beg);
 
     // 读取向量数据
-    disk_data_read.read(
-            reinterpret_cast<char*>(original_vector), d * sizeof(float));
+    disk_data_read.read(reinterpret_cast<char*>(original_vector), d * sizeof(float));
 
     if (disk_data_read.fail()) {
         throw std::runtime_error("Failed to read vector from disk.");
@@ -440,14 +460,104 @@ void IndexIVFPQDisk::load_clusters(size_t list_no, float* original_vectors) {
     disk_data_read.seekg(global_offset, std::ios::beg);
 
     // 读取所有向量数据
-    disk_data_read.read(
-            reinterpret_cast<char*>(original_vectors),
-            d * sizeof(float) * len[list_no]);
+    disk_data_read.read(reinterpret_cast<char*>(original_vectors), d * sizeof(float) * len[list_no]);
 
     if (disk_data_read.fail()) {
         throw std::runtime_error("Failed to read vectors from disk.");
     }
 }
+
+namespace{
+     int sort_coarse(
+        std::vector<idx_t>& listno,            // input: cluster ids
+        std::vector<size_t>& sorted_listno,    // output: sorted cluster ids based on frequency
+        size_t* lens,                          // input: array of cluster sizes (number of vectors in each cluster)
+        size_t nlist,                          // input: maximum number of clusters to cache
+        size_t nvec)                           // input: maximum number of vectors to cache
+    {
+        std::map<idx_t, size_t> freq_map;
+        for (const auto& id : listno) {
+            freq_map[id]++;
+        }
+
+        std::vector<std::pair<idx_t, size_t>> freq_pairs(freq_map.begin(), freq_map.end());
+
+        std::sort(freq_pairs.begin(), freq_pairs.end(), 
+            [](const std::pair<idx_t, size_t>& a, const std::pair<idx_t, size_t>& b) {
+                return a.second > b.second;
+            });
+
+        size_t total_vecs = 0;
+
+        for (const auto& pair : freq_pairs) {
+            idx_t cluster_id = pair.first;
+            //std::cout <<"cluster_id"<<cluster_id <<std::endl;
+            if (nlist != static_cast<size_t>(-1) && sorted_listno.size() >= nlist) {
+                break;
+            }
+
+            if (nvec != static_cast<size_t>(-1)) {
+                total_vecs += lens[cluster_id];
+                if (total_vecs >= nvec) {
+                    // Stop if the total vectors exceed nvec
+                    sorted_listno.push_back(cluster_id);
+                    break;
+                }
+            }
+
+            sorted_listno.push_back(cluster_id);
+        }
+
+        return sorted_listno.size();
+    }
+
+    int warm_up(DiskInvertedListHolder& holder, std::vector<size_t>& indice){
+        holder.warm_up(indice);
+        // TODO return What???
+        return 0;
+    }
+}
+
+int IndexIVFPQDisk::warm_up_nlist(size_t n, float* x, size_t w_nprobe, size_t warm_list){
+    std::vector<idx_t> idx(n * w_nprobe);
+    std::vector<float> coarse_dis(n * w_nprobe);
+    std::vector<size_t> sorted_idx;
+    // Search to get the nearest cluster IDs
+    quantizer->search(n, x, w_nprobe, coarse_dis.data(), idx.data(), nullptr);
+
+    sort_coarse(idx, sorted_idx, this->len, warm_list, static_cast<size_t>(-1));
+    
+    size_t code_size = get_code_size();
+
+    diskInvertedListHolder.set_holder(disk_path, nlist, code_size, aligned_cluster_info);
+    // for(int i = 0; i< warm_list;i++){
+    //     std::cout << "idx:"<<sorted_idx.data()[i] << "  length:" << this->len[sorted_idx.data()[i]] << std::endl;
+    // }
+
+    warm_up(diskInvertedListHolder, sorted_idx);
+    
+    return warm_list;
+}
+
+int IndexIVFPQDisk::warm_up_nvec(size_t n, float* x, size_t w_nprobe, size_t nvec){
+    if(nvec==0){
+        return 0;
+    }
+    std::vector<idx_t> idx(n * w_nprobe);
+    std::vector<float> coarse_dis(n * w_nprobe);
+    std::vector<size_t> sorted_idx;
+    quantizer->search(n, x, w_nprobe, coarse_dis.data(), idx.data(), nullptr);
+    
+    int warm_list = sort_coarse(idx, sorted_idx, this->len, static_cast<size_t>(-1), nvec);
+    //std::cout << "warm_list: "<< warm_list << std::endl;
+    size_t code_size = get_code_size();
+
+    diskInvertedListHolder.set_holder(disk_path, nlist, code_size, aligned_cluster_info);
+    warm_up(diskInvertedListHolder, sorted_idx);
+
+    return warm_list;
+}
+
 
 /** It is a sad fact of software that a conceptually simple function like this
  * becomes very complex when you factor in several ways of parallelizing +
@@ -459,22 +569,19 @@ void IndexIVFPQDisk::search(
         idx_t k_r,
         float* distances_result,
         idx_t* labels_result,
-        const SearchParameters* params_in) const {
+        const SearchParameters* params_in ) const {
     FAISS_THROW_IF_NOT(k_r > 0);
     const IVFSearchParameters* params = nullptr;
     if (params_in) {
         params = dynamic_cast<const IVFSearchParameters*>(params_in);
         FAISS_THROW_IF_NOT_MSG(params, "IndexIVF params have incorrect type");
     }
-    const size_t nprobe =
-            std::min(nlist, params ? params->nprobe : this->nprobe);
+    const size_t nprobe =std::min(nlist, params ? params->nprobe : this->nprobe);
     FAISS_THROW_IF_NOT(nprobe > 0);
 
-    // TODO: make a new distances and labels to contain replica*k results
+    // : make a new distances and labels to contain replica*k results
     //       new k_replica = k * this->reolica
     idx_t k = k_r * this->assign_replicas;
-    // k = 300;
-    printf("k=%ld\n", k);
     std::unique_ptr<idx_t[]> del1(new idx_t[n * k]);
     std::unique_ptr<float[]> del2(new float[n * k]);
     idx_t* labels = del1.get();
@@ -490,11 +597,17 @@ void IndexIVFPQDisk::search(
         std::unique_ptr<idx_t[]> idx(new idx_t[n * nprobe]);
         std::unique_ptr<float[]> coarse_dis(new float[n * nprobe]);
 
-        // auto time_start =
-        //         std::chrono::high_resolution_clock::now(); // time begin
+        auto time_start = std::chrono::high_resolution_clock::now();      // time begin
 
         double t0 = getmillisecs();
-        if (nprobe < 60) {
+
+        if(centroid_index != nullptr && nprobe > 60){
+            std::cout << "Searching in HNSW\n";
+            centroid_index->hnsw.efSearch = 2 * nprobe;
+            centroid_index->search(n,x,nprobe,coarse_dis.get(),idx.get());
+        }
+        else{
+            std::cout << "Searching by quantizer\n";
             quantizer->search(
                     n,
                     x,
@@ -502,26 +615,12 @@ void IndexIVFPQDisk::search(
                     coarse_dis.get(),
                     idx.get(),
                     params ? params->quantizer_params : nullptr);
-        } else {
-            //  printf("IndexIVFPQDisk::search::hnsw way, n=%ld, k=%ld \n",n,
-            //  k);
-            centroid_index->hnsw.efSearch = 200;
-            centroid_index->search(n, x, nprobe, coarse_dis.get(), idx.get());
-            // Check the elements of the array
-            // for (size_t i = 0; i < 100; ++i) {
-            //     std::cout << "Element at index " << i << " = " << idx[i] <<
-            //     std::endl; std::cout << "distance at index " << i << " = " <<
-            //     coarse_dis[i] << std::endl;
-            // }
         }
-
         double t1 = getmillisecs();
-        // std::cout << "Time taken: " << (t1 - t0) << " milliseconds"
-        //           << "nprobe is " << nprobe << std::endl;
         invlists->prefetch_lists(idx.get(), n * nprobe);
 
-        // auto time_end = std::chrono::high_resolution_clock::now();
-        // indexIVFPQDisk_stats.coarse_elapsed += time_end - time_start;
+        auto time_end = std::chrono::high_resolution_clock::now(); 
+        indexIVFPQDisk_stats.coarse_elapsed += time_end - time_start;
 
         search_preassigned(
                 n,
@@ -578,45 +677,45 @@ void IndexIVFPQDisk::search(
         // all)
         sub_search_func(n, x, distances, labels, &indexIVF_stats);
     }
-    // TODO: select top k distinct result
+    // 
 
     // for(idx_t ii = 0; ii < n;ii++){
     //     idx_t begin = ii*k;
     //     for(idx_t jj = 0; jj < k; jj++){
-    //         std::cout<<jj<<":\t label:" <<  labels[begin+jj] << "
-    //         distance:"<<distances[begin+jj] << std::endl;
+    //         std::cout<<jj<<":\t label:" <<  labels[begin+jj] << "  distance:"<<distances[begin+jj] << std::endl;
     //     }
     //     std::cout << std::endl;
     // }
+    
+    auto time_start = std::chrono::high_resolution_clock::now();      // time begin
 
-    // auto time_start = std::chrono::high_resolution_clock::now(); // time begin
-
-    for (idx_t ii = 0; ii < n; ii++) {
-        idx_t begin_r = ii * k_r;
-        idx_t begin = ii * k;
+    for(idx_t ii = 0; ii < n;ii++){
+        idx_t begin_r = ii*k_r;
+        idx_t begin = ii*k;
         idx_t limit = 0;
 
-        for (idx_t jj = 0; jj < k; jj++) {
-            // if(ii==3202)
-            // std::cout << "ii: "<<ii <<"  jj:"<< jj << "
-            // :"<<labels[begin+jj]<< std::endl;
-            if (jj == 0) {
+        for(idx_t jj = 0; jj < k; jj++){
+            //if(ii==3202)
+                //std::cout << "ii: "<<ii <<"  jj:"<< jj << " :"<<labels[begin+jj]<< std::endl;
+            if(jj == 0){
                 distances_result[begin_r] = distances[begin];
                 labels_result[begin_r] = labels[begin];
                 limit++;
-            } else {
-                if (labels[begin + jj] != labels[begin + jj - 1]) {
-                    distances_result[begin_r + limit] = distances[begin + jj];
-                    labels_result[begin_r + limit] = labels[begin + jj];
+            }
+            else{
+                if(labels[begin+jj] != labels[begin+jj-1]){
+                    distances_result[begin_r+limit] = distances[begin+jj];
+                    labels_result[begin_r+limit] = labels[begin+jj];
                     limit++;
                 }
-                if (limit >= k_r)
+                if(limit>=k_r)
                     break;
+
             }
         }
     }
-    // auto time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.rank_elapsed += time_end - time_start;
+    auto time_end = std::chrono::high_resolution_clock::now();       // time end
+    indexIVFPQDisk_stats.rank_elapsed += time_end - time_start;
 }
 
 void IndexIVFPQDisk::search_preassigned(
@@ -630,15 +729,16 @@ void IndexIVFPQDisk::search_preassigned(
         bool store_pairs,
         const IVFSearchParameters* params,
         IndexIVFStats* ivf_stats) const {
-    // auto time_start = std::chrono::high_resolution_clock::now(); // time begin
-
-    FAISS_THROW_IF_NOT(k > 0); // 1. 参数检查
+    
+    auto time_start = std::chrono::high_resolution_clock::now();      // time begin
+    
+    FAISS_THROW_IF_NOT(k > 0);               //1. 参数检查
 
     idx_t nprobe = params ? params->nprobe : this->nprobe;
     nprobe = std::min((idx_t)nlist, nprobe);
-    FAISS_THROW_IF_NOT(nprobe > 0); // 2. nprobe参数初始化 以及检查
+    FAISS_THROW_IF_NOT(nprobe > 0);           //2. nprobe参数初始化 以及检查
 
-    const size_t top_cluster = this->top; // 设置使用不同load_strategy的边界
+    const size_t top_cluster = this->top;     // 设置使用不同load_strategy的边界
 
     const idx_t unlimited_list_size = std::numeric_limits<idx_t>::max();
     idx_t max_codes = params ? params->max_codes : this->max_codes;
@@ -658,7 +758,7 @@ void IndexIVFPQDisk::search_preassigned(
 
     FAISS_THROW_IF_NOT_MSG(
             !invlists->use_iterator || (max_codes == 0 && store_pairs == false),
-            "iterable inverted lists don't support max_codes and store_pairs"); // 3. 参数检查
+            "iterable inverted lists don't support max_codes and store_pairs");              //3. 参数检查
 
     size_t nlistv = 0, ndis = 0, nheap = 0;
 
@@ -667,7 +767,7 @@ void IndexIVFPQDisk::search_preassigned(
 
     bool interrupt = false;
     std::mutex exception_mutex;
-    std::string exception_string; // 4. 统计变量初始化
+    std::string exception_string;                       //4. 统计变量初始化
 
     int pmode = this->parallel_mode & ~PARALLEL_MODE_NO_HEAP_INIT;
     bool do_heap_init = !(this->parallel_mode & PARALLEL_MODE_NO_HEAP_INIT);
@@ -683,23 +783,21 @@ void IndexIVFPQDisk::search_preassigned(
     bool do_parallel = omp_get_max_threads() >= 2 &&
             (pmode == 0           ? false
                      : pmode == 3 ? n > 1
-                     : pmode == 1 ? nprobe > 1
-                                  : nprobe * n > 1); // 5.并行模式检查
+                     : pmode == 1 ? nprobe > 1 
+                                  : nprobe * n > 1);            // 5.并行模式检查
 
     void* inverted_list_context =
             params ? params->inverted_list_context : nullptr;
-
+    
     const float p_factor = this->prune_factor;
 
-    // auto time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.others_elapsed += time_end - time_start;
+    auto time_end = std::chrono::high_resolution_clock::now();       // time end
+    indexIVFPQDisk_stats.others_elapsed += time_end - time_start;
 
-#pragma omp parallel if (do_parallel) \
-        reduction(+ : nlistv, ndis, nheap) // 6. 并行查找
-    {
+#pragma omp parallel if (do_parallel) reduction(+ : nlistv, ndis, nheap)    //6. 并行查找
+    { 
         std::unique_ptr<InvertedListScanner> scanner(
                 get_InvertedListScanner(store_pairs, sel));
-
         /*****************************************************
          * Depending on parallel_mode, there are two possible ways
          * to organize the search. Here we define local functions
@@ -716,7 +814,7 @@ void IndexIVFPQDisk::search_preassigned(
             } else {
                 heap_heapify<HeapForL2>(k, simi, idxi);
             }
-        }; // 1. 初始化结果
+        };            // 1. 初始化结果
 
         auto add_local_results = [&](const float* local_dis,
                                      const idx_t* local_idx,
@@ -726,8 +824,8 @@ void IndexIVFPQDisk::search_preassigned(
                 heap_addn<HeapForIP>(k, simi, idxi, local_dis, local_idx, k);
             } else {
                 heap_addn<HeapForL2>(k, simi, idxi, local_dis, local_idx, k);
-            }
-        }; // 2. 增加计算好的结果到堆
+            }   
+        };      // 2. 增加计算好的结果到堆
 
         auto reorder_result = [&](float* simi, idx_t* idxi) {
             if (!do_heap_init)
@@ -737,7 +835,7 @@ void IndexIVFPQDisk::search_preassigned(
             } else {
                 heap_reorder<HeapForL2>(k, simi, idxi);
             }
-        }; // 3. 重排序函数
+        };           // 3. 重排序函数
 
         // single list scan using the current scanner (with query
         // set porperly) and storing results in simi and idxi
@@ -746,8 +844,7 @@ void IndexIVFPQDisk::search_preassigned(
                                  float* simi,
                                  idx_t* idxi,
                                  idx_t list_size_max) {
-            // auto time_start = std::chrono::high_resolution_clock::now(); //
-            // time begin
+            //auto time_start = std::chrono::high_resolution_clock::now();      // time begin
             if (key < 0) {
                 // not enough centroids for multiprobe
                 return (size_t)0;
@@ -767,9 +864,8 @@ void IndexIVFPQDisk::search_preassigned(
 
             nlistv++;
 
-            // auto time_end = std::chrono::high_resolution_clock::now(); //
-            // time end indexIVFPQDisk_stats.others_elapsed += time_end -
-            // time_start;
+            //auto time_end = std::chrono::high_resolution_clock::now();       // time end
+            //indexIVFPQDisk_stats.others_elapsed += time_end - time_start;
 
             try {
                 if (invlists->use_iterator) {
@@ -812,7 +908,12 @@ void IndexIVFPQDisk::search_preassigned(
                         codes += jmin * code_size;
                         ids += jmin;
                     }
-
+                    // if(ids == nullptr){
+                    //     std::cout << "NULLPTR!!" << std::endl;
+                    // }else{
+                    //     std::cout << "NONE NULL" << std::endl;
+                    // }
+                    
                     nheap += scanner->scan_codes(
                             list_size, codes, ids, simi, idxi, k);
 
@@ -829,10 +930,9 @@ void IndexIVFPQDisk::search_preassigned(
 
         /****************************************************
          * Actual loops, depending on parallel_mode
-         * pmode == 0或pmode ==
-         3：对每个查询向量进行并行处理，每个查询向量都扫描所有的倒排列表。 pmode
-         == 1：每个查询向量依次进行处理，但对倒排列表的扫描是并行的。 pmode ==
-         2：每个倒排列表的扫描是并行的，查询向量的结果在最后进行合并。
+         * pmode == 0或pmode == 3：对每个查询向量进行并行处理，每个查询向量都扫描所有的倒排列表。
+           pmode == 1：每个查询向量依次进行处理，但对倒排列表的扫描是并行的。
+           pmode == 2：每个倒排列表的扫描是并行的，查询向量的结果在最后进行合并。
          ****************************************************/
 
         if (pmode == 0 || pmode == 3) {
@@ -841,40 +941,53 @@ void IndexIVFPQDisk::search_preassigned(
                 if (interrupt) {
                     continue;
                 }
-                // auto time_start =
-                //         std::chrono::high_resolution_clock::now(); // time begin
+                auto time_start = std::chrono::high_resolution_clock::now();      // time begin
                 // loop over queries
-                scanner->set_query(
-                        x + i * d); // todo: reset hash table in scanner
-
+                scanner->set_query(x + i * d);  // todo: reset hash table in scanner
+                
                 float* simi = distances + i * k;
                 idx_t* idxi = labels + i * k;
 
                 init_result(simi, idxi);
 
                 idx_t nscan = 0;
-                // auto time_end =
-                        // std::chrono::high_resolution_clock::now(); // time end
-                // indexIVFPQDisk_stats.others_elapsed += time_end - time_start;
+                auto time_end = std::chrono::high_resolution_clock::now();       // time end
+                indexIVFPQDisk_stats.others_elapsed += time_end - time_start;
+                // TODO scan async??? here
+                size_t valid_probe = 0;
                 // loop over probes
                 for (size_t ik = 0; ik < nprobe; ik++) {
-                    /*
-                   prune redundant clusters
-                   */
-                    if (coarse_dis[i * nprobe + ik] >
-                        p_factor * coarse_dis[i * nprobe]) {
-                        // std::cout << "coarse_dis[i * nprobe + ik]: " <<
-                        // coarse_dis[i * nprobe + ik] ; std::cout << " <>" <<
-                        // p_factor << "*"<< coarse_dis[i * nprobe]; std::cout
-                        // << " = " << p_factor * coarse_dis[i * nprobe + ik] <<
-                        // std::endl;
-                        break;
+
+                     /*
+                    prune redundant clusters
+                    */
+                    if(coarse_dis[i * nprobe + ik] > p_factor * coarse_dis[i * nprobe])
+                    {
+                        //std::cout << "coarse_dis[i * nprobe + ik]: " << coarse_dis[i * nprobe + ik] ;
+                        //std::cout << " <>" << p_factor << "*"<< coarse_dis[i * nprobe];
+                        //std::cout << " = " << p_factor * coarse_dis[i * nprobe + ik] << std::endl;
+                        break; 
                     }
-                    // indexIVFPQDisk_stats.pruned++;
-                    if (ik >= top_cluster)
+
+                    // if(ik>=21 && ik <= 30){
+                    //     continue;
+                    // }
+
+                    valid_probe++;
+                    indexIVFPQDisk_stats.pruned++;
+                    if(ik >= top_cluster){
                         scanner->set_strategy(PARTIALLY);
-                    else
+#ifdef USING_ASYNC  
+                        scanner.get()->async_submit(valid_probe);
+                        if(ik!=0 && ik%20 == 0){
+                            //std::cout << "ik:" <<ik <<"   Async_submit!!!!" << std::endl;
+                            scanner.get()->async_submit();
+                        }
+#endif
+                    }
+                    else{
                         scanner->set_strategy(FULLY);
+                    }
 
                     nscan += scan_one_list(
                             keys[i * nprobe + ik],
@@ -886,6 +999,11 @@ void IndexIVFPQDisk::search_preassigned(
                         break;
                     }
                 }
+#ifdef USING_ASYNC
+                scanner.get()->async_submit();
+                //std::cout << "Valid_probe " << valid_probe << std::endl;
+#endif
+
                 ndis += nscan;
                 reorder_result(simi, idxi);
 
@@ -904,7 +1022,8 @@ void IndexIVFPQDisk::search_preassigned(
 
 #pragma omp for schedule(dynamic)
                 for (idx_t ik = 0; ik < nprobe; ik++) {
-                    if (ik > top_cluster)
+
+                    if(ik > top_cluster)
                         scanner->set_strategy(PARTIALLY);
 
                     ndis += scan_one_list(
@@ -990,8 +1109,8 @@ void IndexIVFPQDisk::search_preassigned(
     ivf_stats->nheap_updates += nheap;
 }
 
-// ----------------------modification from the original
-// IVFPQ----------------------------------------------
+
+// ----------------------modification from the original IVFPQ----------------------------------------------
 
 namespace {
 
@@ -1189,8 +1308,7 @@ struct QueryTables {
             dis0 = coarse_dis;
 
             const MultiIndexQuantizer* miq =
-                    dynamic_cast<const MultiIndexQuantizer*>(
-                            ivfpq_disk.quantizer);
+                    dynamic_cast<const MultiIndexQuantizer*>(ivfpq_disk.quantizer);
             FAISS_THROW_IF_NOT(miq);
             const ProductQuantizer& cpq = miq->pq;
             int Mf = pq.M / cpq.M;
@@ -1244,8 +1362,7 @@ struct QueryTables {
             dis0 = coarse_dis;
 
             const MultiIndexQuantizer* miq =
-                    dynamic_cast<const MultiIndexQuantizer*>(
-                            ivfpq_disk.quantizer);
+                    dynamic_cast<const MultiIndexQuantizer*>(ivfpq_disk.quantizer);
             FAISS_THROW_IF_NOT(miq);
             const ProductQuantizer& cpq = miq->pq;
             int Mf = pq.M / cpq.M;
@@ -1295,11 +1412,11 @@ struct KnnSearchResults {
 
     size_t nup;
 
-    inline bool check_repeat(idx_t j) {
+    inline bool check_repeat(idx_t j){
         // idx_t id = ids ? ids[j] : lo_build(key, j);
         // for (size_t ii = 0; ii < k; ii++) {
         //     if (id == heap_ids[ii])
-        //         return true;
+        //         return true;   
         // }
         return false;
     }
@@ -1354,9 +1471,7 @@ struct IVFPQDiskScannerT : QueryTables {
     const IDType* list_ids;
     size_t list_size;
 
-    IVFPQDiskScannerT(
-            const IndexIVFPQDisk& ivfpq_disk,
-            const IVFSearchParameters* params)
+    IVFPQDiskScannerT(const IndexIVFPQDisk& ivfpq_disk, const IVFSearchParameters* params)
             : QueryTables(ivfpq_disk, params) {
         assert(METRIC_TYPE == metric_type);
     }
@@ -1369,212 +1484,133 @@ struct IVFPQDiskScannerT : QueryTables {
 
         if (mode == 2) {
             dis0 = precompute_list_tables();
+            //std::cout << "dis0:" <<dis0 << std::endl;
         } else if (mode == 1) {
             dis0 = precompute_list_table_pointers();
         }
     }
 
-    // /// store all result
-    // template <class SearchResultType>
-    // int scan_list_with_table(
-    //         size_t ncode,
-    //         const uint8_t* codes,
-    //         float* local_dis,
-    //         idx_t* local_ids,
-    //         idx_t* knn_ids, // skip some existed entries directly
-    //         const idx_t* list_ids,
-    //         size_t k,
-    //         SearchResultType& res) const {
-    //     int counter = 0;
-    //     int operation = 0;
+    
+    /// store all result
+    template <class SearchResultType>
+    int scan_list_with_table(
+            size_t ncode,
+            const uint8_t* codes,
+            float* local_dis,
+            idx_t* local_ids,
+            idx_t* knn_ids,              // skip some existed entries directly
+            const idx_t* list_ids,
+            size_t k,
+            SearchResultType& res) const {
+        int counter = 0;
+        int operation = 0;
 
-    //     size_t saved_j[4] = {0, 0, 0, 0};
-    //     for (size_t j = 0; j < ncode; j++) {
-    //         if (res.skip_entry(j)) {
-    //             continue;
-    //         }
-    //         /* skip scanned entry, simple implementation*/
-    //         // bool scanned = false;
-    //         // for (size_t ii = 0; ii < k; ii++) {
-    //         //     if (list_ids[j] == knn_ids[ii])
-    //         //         scanned = true;
-    //         // }
-    //         // if (scanned) {
-    //         //     continue;
-    //         // }
-    //         // if (visited.find(list_ids[j]) != visited.end()) {
-    //         //     continue;
-    //         // }
-    //         // visited.insert(list_ids[j]);
-    //         // std::cout << "list_ids[j]: " << list_ids[j] << std::endl;
+        size_t saved_j[4] = {0, 0, 0, 0};
+        for (size_t j = 0; j < ncode; j++) {
+            if (res.skip_entry(j)) {
+                continue;
+            }
+            /* skip scanned entry, simple implementation*/
+            // bool scanned = false;
+            // for (size_t ii = 0; ii < k; ii++) {
+            //     if (list_ids[j] == knn_ids[ii])
+            //         scanned = true;   
+            // }
+            // if (scanned) {
+            //     continue;
+            // }
+            // if (visited.find(list_ids[j]) != visited.end()) {
+            //     continue; 
+            // }
+            // visited.insert(list_ids[j]);
+            //std::cout << "list_ids[j]: " << list_ids[j] << std::endl;
 
-    //         // res.add() discard repetitive result
+            // res.add() discard repetitive result
 
-    //         ///> if we try to remove repetitive vector here, it would be
-    //         ///extraordinarily slow
+            ///> if we try to remove repetitive vector here, it would be extraordinarily slow
 
-    //         saved_j[0] = (counter == 0) ? j : saved_j[0];
-    //         saved_j[1] = (counter == 1) ? j : saved_j[1];
-    //         saved_j[2] = (counter == 2) ? j : saved_j[2];
-    //         saved_j[3] = (counter == 3) ? j : saved_j[3];
+            
 
-    //         counter += 1;
-    //         if (counter == 4) {
-    //             float distance_0 = 0;
-    //             float distance_1 = 0;
-    //             float distance_2 = 0;
-    //             float distance_3 = 0;
-    //             distance_four_codes<PQDecoder>(
-    //                     pq.M,
-    //                     pq.nbits,
-    //                     sim_table,
-    //                     codes + saved_j[0] * pq.code_size,
-    //                     codes + saved_j[1] * pq.code_size,
-    //                     codes + saved_j[2] * pq.code_size,
-    //                     codes + saved_j[3] * pq.code_size,
-    //                     distance_0,
-    //                     distance_1,
-    //                     distance_2,
-    //                     distance_3);
-    //             *(local_dis++) = dis0 + distance_0;
-    //             *(local_ids++) = saved_j[0];
-    //             *(local_dis++) = dis0 + distance_1;
-    //             *(local_ids++) = saved_j[1];
-    //             *(local_dis++) = dis0 + distance_2;
-    //             *(local_ids++) = saved_j[2];
-    //             *(local_dis++) = dis0 + distance_3;
-    //             *(local_ids++) = saved_j[3];
+            saved_j[0] = (counter == 0) ? j : saved_j[0];
+            saved_j[1] = (counter == 1) ? j : saved_j[1];
+            saved_j[2] = (counter == 2) ? j : saved_j[2];
+            saved_j[3] = (counter == 3) ? j : saved_j[3];
 
-    //             operation += 4;
-    //             // res.add(saved_j[0], dis0 + distance_0);
-    //             // res.add(saved_j[1], dis0 + distance_1);
-    //             // res.add(saved_j[2], dis0 + distance_2);
-    //             // res.add(saved_j[3], dis0 + distance_3);
-    //             counter = 0;
-    //         }
-    //     }
+            counter += 1;
+            if (counter == 4) {
+                float distance_0 = 0;
+                float distance_1 = 0;
+                float distance_2 = 0;
+                float distance_3 = 0;
+                distance_four_codes<PQDecoder>(
+                        pq.M,
+                        pq.nbits,
+                        sim_table,
+                        codes + saved_j[0] * pq.code_size,
+                        codes + saved_j[1] * pq.code_size,
+                        codes + saved_j[2] * pq.code_size,
+                        codes + saved_j[3] * pq.code_size,
+                        distance_0,
+                        distance_1,
+                        distance_2,
+                        distance_3);
+                *(local_dis++) = dis0 + distance_0;
+                *(local_ids++) = saved_j[0];
+                *(local_dis++) = dis0 + distance_1;
+                *(local_ids++) = saved_j[1];
+                *(local_dis++) = dis0 + distance_2;
+                *(local_ids++) = saved_j[2];
+                *(local_dis++) = dis0 + distance_3;
+                *(local_ids++) = saved_j[3];
 
-    //     if (counter >= 1) {
-    //         float dis = dis0 +
-    //                 distance_single_code<PQDecoder>(
-    //                             pq.M,
-    //                             pq.nbits,
-    //                             sim_table,
-    //                             codes + saved_j[0] * pq.code_size);
-    //         *(local_dis++) = dis;
-    //         *(local_ids++) = saved_j[0];
-    //         operation++;
-    //         // res.add(saved_j[0], dis);
-    //     }
-    //     if (counter >= 2) {
-    //         float dis = dis0 +
-    //                 distance_single_code<PQDecoder>(
-    //                             pq.M,
-    //                             pq.nbits,
-    //                             sim_table,
-    //                             codes + saved_j[1] * pq.code_size);
-    //         *(local_dis++) = dis;
-    //         *(local_ids++) = saved_j[1];
-    //         operation++;
-    //         // res.add(saved_j[1], dis);
-    //     }
-    //     if (counter >= 3) {
-    //         float dis = dis0 +
-    //                 distance_single_code<PQDecoder>(
-    //                             pq.M,
-    //                             pq.nbits,
-    //                             sim_table,
-    //                             codes + saved_j[2] * pq.code_size);
-    //         *(local_dis++) = dis;
-    //         *(local_ids++) = saved_j[2];
-    //         operation++;
-    //         // res.add(saved_j[2], dis);
-    //     }
-    //     return operation;
-    // }
-// new
-template <class SearchResultType>
-int scan_list_with_table(
-        size_t ncode,
-        const uint8_t* codes,
-        float* local_dis,
-        idx_t* local_ids,
-        size_t k,
-        SearchResultType& res) const {
-            // auto time_start = std::chrono::high_resolution_clock::now();
-    int operation = 0;
-    size_t saved_j[4];
-    for (size_t j = 0; j + 4 <= ncode; j += 4) {
-                // auto time_start1 = std::chrono::high_resolution_clock::now();
-                // Prefetch the next 16 entries to reduce cache misses
-        if (j + 16 < ncode) {
-            __builtin_prefetch(codes + (j + 16) * pq.code_size, 0, 1);   // Prefetch next batch of codes
-            __builtin_prefetch(local_dis + 16, 1, 1);                    // Prefetch next batch of local_dis
-            __builtin_prefetch(local_ids + 16, 1, 1);                    // Prefetch next batch of local_ids
+                operation +=4;
+                //res.add(saved_j[0], dis0 + distance_0);
+                //res.add(saved_j[1], dis0 + distance_1);
+                //res.add(saved_j[2], dis0 + distance_2);
+                //res.add(saved_j[3], dis0 + distance_3);
+                counter = 0;
+            }
         }
-        // Check for entries to skip
-        if (res.skip_entry(j) && res.skip_entry(j + 1) && 
-            res.skip_entry(j + 2) && res.skip_entry(j + 3)) {
-            continue;
+
+        if (counter >= 1) {
+            float dis = dis0 +
+                    distance_single_code<PQDecoder>(
+                                pq.M,
+                                pq.nbits,
+                                sim_table,
+                                codes + saved_j[0] * pq.code_size);
+            *(local_dis++) = dis;
+            *(local_ids++) = saved_j[0];
+            operation ++;
+            //res.add(saved_j[0], dis);
         }
-        saved_j[0] = j;
-        saved_j[1] = j + 1;
-        saved_j[2] = j + 2;
-        saved_j[3] = j + 3;
- 
-        float distance_0, distance_1, distance_2, distance_3;
-        // Compute distances in a batch (SIMD can be used here)
-        distance_four_codes<PQDecoder>(
-            pq.M,
-            pq.nbits,
-            sim_table,
-            codes + saved_j[0] * pq.code_size,
-            codes + saved_j[1] * pq.code_size,
-            codes + saved_j[2] * pq.code_size,
-            codes + saved_j[3] * pq.code_size,
-            distance_0,
-            distance_1,
-            distance_2,
-            distance_3);
-        //  auto time_end1 = std::chrono::high_resolution_clock::now();
-        // indexIVFPQDisk_stats.PQ_four_code1 += time_end1 - time_start1;
-        // auto time_start2 = std::chrono::high_resolution_clock::now();
-        // Store distances and indices in local arrays
-        *(local_dis++) = dis0 + distance_0;
-        *(local_ids++) = saved_j[0];
-        *(local_dis++) = dis0 + distance_1;
-        *(local_ids++) = saved_j[1];
-        *(local_dis++) = dis0 + distance_2;
-        *(local_ids++) = saved_j[2];
-        *(local_dis++) = dis0 + distance_3;
-        *(local_ids++) = saved_j[3];
-        operation += 4;
-        // auto time_end2 = std::chrono::high_resolution_clock::now();
-        // indexIVFPQDisk_stats.PQ_four_code2 += time_end2 - time_start2;
+        if (counter >= 2) {
+            float dis = dis0 +
+                    distance_single_code<PQDecoder>(
+                                pq.M,
+                                pq.nbits,
+                                sim_table,
+                                codes + saved_j[1] * pq.code_size);
+            *(local_dis++) = dis;
+            *(local_ids++) = saved_j[1];
+            operation ++;
+            //res.add(saved_j[1], dis);
+        }
+        if (counter >= 3) {
+            float dis = dis0 +
+                    distance_single_code<PQDecoder>(
+                                pq.M,
+                                pq.nbits,
+                                sim_table,
+                                codes + saved_j[2] * pq.code_size);
+            *(local_dis++) = dis;
+            *(local_ids++) = saved_j[2];
+            operation ++;
+            //res.add(saved_j[2], dis);
+        }
+        return operation;
     }
-        //  auto time_end = std::chrono::high_resolution_clock::now();
-        // indexIVFPQDisk_stats.PQ_four_code += time_end - time_start;
-      
-    // Handle the remaining entries
-    for (size_t j = (ncode / 4) * 4; j < ncode; j++) {
-        if (res.skip_entry(j)) {
-            continue;
-        }
-        // Prefetch the next entry in the tail case (if any)
-        if (j + 1 < ncode) {
-            __builtin_prefetch(codes + (j + 1) * pq.code_size, 0, 1);   // Prefetch next code
-            __builtin_prefetch(local_dis + 1, 1, 1);                    // Prefetch next local_dis
-            __builtin_prefetch(local_ids + 1, 1, 1);                    // Prefetch next local_ids
-        }
-        float dis = dis0 + distance_single_code<PQDecoder>(
-                              pq.M, pq.nbits, sim_table, codes + j * pq.code_size);
-        *(local_dis++) = dis;
-        *(local_ids++) = j;
-        operation++;
-    }
-         
-    return operation;
-}
+
     /// version of the scan where we use precomputed tables.
     template <class SearchResultType>
     void scan_list_with_table(
@@ -1705,7 +1741,7 @@ int scan_list_with_table(
             if (METRIC_TYPE == METRIC_INNER_PRODUCT) {
                 dis = dis0 + fvec_inner_product(decoded_vec, qi, d);
             } else {
-                dis = fvec_L2sqr(decoded_vec, dvec, d);
+                dis = fvec_L2sqr_simd(decoded_vec, dvec, d);
             }
             res.add(j, dis);
         }
@@ -1848,71 +1884,64 @@ int scan_list_with_table(
     }
 };
 
-namespace {
 
-// compute distance
-void compute_precise_dis_simd(
-        const float* query,
-        const float* data,
-        size_t* pos,
-        int D,
-        float* distances,
-        size_t vec_num) {
-    for (size_t i = 0; i < vec_num; i++) {
-        distances[i] = fvec_L2sqr(query, data + pos[i] * D, D);
+
+
+namespace{
+
+//compute distance
+void compute_precise_dis_simd(const float* query, const float* data, size_t* pos, int D, float* distances, size_t vec_num){
+    for(size_t i = 0; i < vec_num; i++){
+        distances[i] = fvec_L2sqr_simd(query, data + pos[i] * D, D);
     }
 }
 
-void compute_precise_dis_batch(
-        const float* query,
-        const float* data,
-        size_t* pos,
-        int D,
-        float* distances,
-        size_t vec_num) {
+void compute_precise_dis_batch(const float* query, const float* data, size_t* pos, int D, float* distances, size_t vec_num){ 
     size_t i = 0;
     for (; i + 4 <= vec_num; i += 4) {
-        fvec_L2sqr_batch_4(
-                query,
-                data + pos[i] * D,
-                data + pos[i + 1] * D,
-                data + pos[i + 2] * D,
-                data + pos[i + 3] * D,
-                D,
-                distances[i],
-                distances[i + 1],
-                distances[i + 2],
-                distances[i + 3]);
+        fvec_L2sqr_batch_4(query, 
+                           data + pos[i] * D, 
+                           data + pos[i + 1] * D, 
+                           data + pos[i + 2] * D, 
+                           data + pos[i + 3] * D, 
+                           D,
+                           distances[i],
+                           distances[i + 1],
+                           distances[i + 2],
+                           distances[i + 3]); 
     }
-
+    
     for (; i < vec_num; i++) {
-        distances[i] = fvec_L2sqr(query, data + pos[i] * D, D);
+        distances[i] = fvec_L2sqr_simd(query, data + pos[i] * D, D);
     }
 }
 
-// fread
-template <class C, bool use_sel>
+
+
+//fread
+template<class C, bool use_sel>
 void disk_full_fread(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
+    KnnSearchResults<C, use_sel>* res,
+    int D,
+    size_t len,
+    size_t cluster_begin,
+    size_t single_offset,
+    int real_heap,
 
-        float factor,
-        float factor_partial,
+    float factor,
+    float factor_partial,
 
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
+    float* heap_sim,
+    float* list_sim,
+    idx_t* list_ids,
 
-        float* query,
-        // file descriptor?
-        FILE* disk_data) {
+    float* query,
+    // file descriptor?
+    FILE* disk_data
+){
     int stats_compare = 0;
     int stats_rerank = 0;
-    // auto time_start = std::chrono::high_resolution_clock::now(); // time begin
+    auto time_start = std::chrono::high_resolution_clock::now(); //time begin
     std::vector<float> vec(D * len);
     size_t offset = cluster_begin * single_offset;
 
@@ -1924,595 +1953,666 @@ void disk_full_fread(
     size_t read_count = fread(vec.data(), sizeof(float), D * len, disk_data);
     float* cluster_data = vec.data();
 
-    // auto time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.disk_full_elapsed += time_end - time_start;
+    auto time_end = std::chrono::high_resolution_clock::now();   //time end
+    indexIVFPQDisk_stats.disk_full_elapsed += time_end - time_start;
+    
+    time_start = std::chrono::high_resolution_clock::now(); //time begin
 
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
+    for(size_t i = 0; i < real_heap; i++ ){
+        if (list_sim[i] < heap_sim[0] * factor) {   // rerank
+            // skip repetitive entries
 
-    for (size_t i = 0; i < real_heap; i++) {
-        if (list_sim[i] < heap_sim[0] * factor) { // rerank
-            // TODO skip repetitive entries
 
-            float distance =
-                    fvec_L2sqr(query, cluster_data + list_ids[i] * D, D);
+            float distance = fvec_L2sqr_simd(query, cluster_data + list_ids[i] * D, D);
             res->add(list_ids[i], distance);
-            // stats_rerank++;
+            stats_rerank++;
         }
-        // stats_compare++;
+        stats_compare++;
     }
 
-    // time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
+    time_end = std::chrono::high_resolution_clock::now(); //time end
+    indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
 
-    // indexIVFPQDisk_stats.full_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.full_cluster_compare += stats_compare;
+    indexIVFPQDisk_stats.full_cluster_rerank += stats_rerank;
+    indexIVFPQDisk_stats.full_cluster_compare += stats_compare;
+
+
 }
 
-template <class C, bool use_sel>
+template<class C, bool use_sel>
 void disk_partial_fread(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
+    KnnSearchResults<C, use_sel>* res,
+    int D,
+    size_t len,
+    size_t cluster_begin,
+    size_t single_offset,
+    int real_heap,
 
-        float factor,
-        float factor_partial,
+    float factor,
+    float factor_partial,
 
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
+    float* heap_sim,
+    float* list_sim,
+    idx_t* list_ids,
 
-        float* query,
-        // file descriptor?
-        FILE* disk_data) {
+    float* query,
+    // file descriptor?
+    FILE* disk_data)
+{
     int stats_compare = 0;
     int stats_rerank = 0;
     std::vector<float> vec(D);
     size_t offset = cluster_begin * single_offset;
     for (size_t i = 0; i < real_heap; i++) {
         if (list_sim[i] < heap_sim[0] * factor_partial) {
-            // auto time_start =
-            //         std::chrono::high_resolution_clock::now(); // time begin
-            // TODO skip repetitive entries
-            // if(res->check_repeat(list_ids[i]))
-            // continue;
 
+            auto time_start = std::chrono::high_resolution_clock::now();  // time begin
+            // skip repetitive entries
+            //if(res->check_repeat(list_ids[i]))
+                //continue;
+            
             fseek(disk_data, offset, SEEK_SET);
-            fseek(disk_data, list_ids[i] * single_offset, SEEK_CUR);
-
+            fseek(disk_data, list_ids[i]* single_offset, SEEK_CUR);
+ 
             size_t read_count = fread(vec.data(), sizeof(float), D, disk_data);
 
-            // auto time_end = std::chrono::high_resolution_clock::now();
-            // indexIVFPQDisk_stats.disk_partial_elapsed +=
-                    // time_end - time_start; // time end
+            auto time_end = std::chrono::high_resolution_clock::now();
+            indexIVFPQDisk_stats.disk_partial_elapsed += time_end - time_start;  // time end
 
-            // time_start =
-            //         std::chrono::high_resolution_clock::now(); // time begin
+            time_start = std::chrono::high_resolution_clock::now();  // time begin
 
-            float distance = fvec_L2sqr(query, vec.data(), D);
+            float distance = fvec_L2sqr_simd(query, vec.data(), D);
             res->add(list_ids[i], distance);
-            // stats_rerank++;
+            //std::cout << "list_ids[i]:" << list_ids[i] << " distance:"<<distance << std::endl;
+            stats_rerank++;
 
-            // time_end = std::chrono::high_resolution_clock::now(); // time end
-            // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
+            time_end = std::chrono::high_resolution_clock::now();  // time end
+            indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
         }
 
-        // stats_compare++;
+        stats_compare++;
     }
 
-    // indexIVFPQDisk_stats.partial_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.partial_cluster_compare += stats_compare;
+    indexIVFPQDisk_stats.partial_cluster_rerank += stats_rerank;
+    indexIVFPQDisk_stats.partial_cluster_compare += stats_compare;
+
+
 }
 
-// ifstream
-template <class C, bool use_sel>
-void disk_full_ifs(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
+template<class C, bool use_sel>
+void disk_fully_process(KnnSearchResults<C, use_sel>* res,
+                        int D,
+                        size_t len,
+                        size_t listno,
+                        Aligned_Cluster_Info* acInfo,
 
-        float factor,
-        float factor_partial,
 
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
+                        float factor,
+                        float factor_partial,
 
-        float* query,
-        std::ifstream& disk_data) {
+                        float* heap_sim,
+                        float* list_sim,
+                        idx_t* list_ids,
+
+                        float* query,
+                        DiskIOProcessor* diskIOprocessor){
     int stats_compare = 0;
     int stats_rerank = 0;
-    // auto time_start = std::chrono::high_resolution_clock::now(); // time begin
+    auto time_start = std::chrono::high_resolution_clock::now(); //time begin
     std::vector<float> vec(D * len);
-    size_t offset = cluster_begin * single_offset;
-
-    disk_data.seekg(offset, std::ios::beg);
-    disk_data.read(
-            reinterpret_cast<char*>(vec.data()), D * len * sizeof(float));
-
+    // ********Disk Process Begin**********
+    diskIOprocessor->disk_io_all(D, len, listno, vec.data(), acInfo);
+    // ********Disk Process End ***********
     float* cluster_data = vec.data();
-
-    // auto time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.disk_full_elapsed += time_end - time_start;
-
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
-
-    // new version: compute precise distance by batch
-    // 1. record postions of the vector to be calculated
-    std::vector<size_t> positions(len);
-    size_t* p_pos = positions.data();
-    size_t* p_begin = p_pos;
-    // 2. find the smaller one of threshold
-    float threshold =
-            C::cmp(list_sim[0], heap_sim[0]) ? heap_sim[0] : list_sim[0];
-    // 3. record vectors number
-    size_t vec_num = 0;
-
-    for (size_t i = 0; i < real_heap; i++) {
-        if (list_sim[i] < threshold * factor) {
-            *p_pos = list_ids[i];
-            p_pos++;
-            vec_num++;
-            // stats_rerank++;
+    for(size_t i = 0; i < len; i++ ){
+        if (list_sim[i] < heap_sim[0] * factor) {   // rerank
+            float distance = fvec_L2sqr_simd(query, cluster_data + list_ids[i] * D, D);
+            res->add(list_ids[i], distance);
+            stats_rerank++;
         }
-        // stats_compare++;
-    }
-    std::vector<float> distances(vec_num);
-    float* p_dis = distances.data();
-    compute_precise_dis_simd(
-            query, cluster_data, p_begin, D, distances.data(), vec_num);
-    for (size_t i = 0; i < vec_num; i++) {
-        res->add(p_begin[i], p_dis[i]);
+        stats_compare++;
     }
 
-    // time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
-
-    // indexIVFPQDisk_stats.full_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.full_cluster_compare += stats_compare;
 }
 
-template <class C, bool use_sel>
-void disk_partial_ifs(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
+template<class C, bool use_sel>
+void disk_partially_process(KnnSearchResults<C, use_sel>* res,
+                            int D,
+                            size_t len,
+                            size_t listno,
+                            Aligned_Cluster_Info* acInfo,
 
-        float factor,
-        float factor_partial,
+                            float factor,
+                            float factor_partial,
 
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
+                            float* heap_sim,
+                            float* list_sim,
+                            idx_t* list_ids,
 
-        float* query,
-        std::ifstream& disk_data // 传入 ifstream 引用
-) {
+                            float* query,
+                            DiskIOProcessor* diskIOprocessor){
     int stats_compare = 0;
     int stats_rerank = 0;
     std::vector<float> vec(D);
-    size_t offset = cluster_begin * single_offset;
-
-    for (size_t i = 0; i < real_heap; i++) {
+    for (size_t i = 0; i < len; i++) {
         if (list_sim[i] < heap_sim[0] * factor_partial) {
-            // auto time_start =
-            //         std::chrono::high_resolution_clock::now(); // time begin
 
-            // if(res->check_repeat(list_ids[i]))
-            // continue;
+            auto time_start = std::chrono::high_resolution_clock::now();  // time begin
+            diskIOprocessor->disk_io_single(D, len, listno, i, vec.data(), acInfo);
 
-            disk_data.seekg(
-                    offset + list_ids[i] * single_offset, std::ios::beg);
-            disk_data.read(
-                    reinterpret_cast<char*>(vec.data()), D * sizeof(float));
+            auto time_end = std::chrono::high_resolution_clock::now();
+            indexIVFPQDisk_stats.disk_partial_elapsed += time_end - time_start;  // time end
 
-            // auto time_end = std::chrono::high_resolution_clock::now();
-            // indexIVFPQDisk_stats.disk_partial_elapsed +=
-            //         time_end - time_start; // time end
+            time_start = std::chrono::high_resolution_clock::now();  // time begin
 
-            // time_start =
-            //         std::chrono::high_resolution_clock::now(); // time begin
-
-            float distance = fvec_L2sqr(query, vec.data(), D);
+            float distance = fvec_L2sqr_simd(query, vec.data(), D);
             res->add(list_ids[i], distance);
-            // stats_rerank++;
+            //std::cout << "list_ids[i]:" << list_ids[i] << " distance:"<<distance << std::endl;
+            stats_rerank++;
 
-            // time_end = std::chrono::high_resolution_clock::now(); // time end
-            // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
+            time_end = std::chrono::high_resolution_clock::now();  // time end
+            indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
         }
 
-        // stats_compare++;
+        stats_compare++;
     }
 
-    // indexIVFPQDisk_stats.partial_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.partial_cluster_compare += stats_compare;
+    indexIVFPQDisk_stats.partial_cluster_rerank += stats_rerank;
+    indexIVFPQDisk_stats.partial_cluster_compare += stats_compare;
+
+
 }
 
-template <class C, bool use_sel>
-void disk_full_read(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
 
-        float factor,
-        float factor_partial,
+template<class C, bool use_sel>
+void disk_fully_async(KnnSearchResults<C, use_sel>* res,
+                        int D,
+                        size_t len,
+                        size_t listno,
+                        Aligned_Cluster_Info* acInfo,
 
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
 
-        float* query,
-        int disk_fd) {
+                        float factor,
+                        float factor_partial,
+
+                        float* heap_sim,
+                        idx_t* heap_ids,
+
+                        std::shared_ptr<std::vector<float>>& list_sim,
+                        std::shared_ptr<std::vector<idx_t>>& list_ids,
+
+                        float* query,
+                        DiskIOProcessor* diskIOprocessor){
     int stats_compare = 0;
     int stats_rerank = 0;
-    // auto time_start = std::chrono::high_resolution_clock::now(); // time begin
-    std::vector<float> vec(D * len);
-    size_t offset = cluster_begin * single_offset;
+    auto time_start = std::chrono::high_resolution_clock::now(); //time begin
+    
+    Aligned_Cluster_Info* cluster_info = &acInfo[listno];
 
-    lseek(disk_fd, offset, SEEK_SET);
+    //auto buffer = std::make_shared<std::vector<char>>(cluster_info->page_count * diskIOprocessor->page_size);
+    std::shared_ptr<AsyncReadRequest> request = std::make_shared<AsyncReadRequest>();
+    // TODO 补全request的条件
+    // page number
+    //request->m_offset = cluster_info->page_start * diskIOprocessor->page_size;
+    //request->m_readSize = cluster_info->page_count * diskIOprocessor->page_size;
 
-    ssize_t bytesRead = read(disk_fd, vec.data(), D * len * sizeof(float));
+    request->m_offset = cluster_info->page_start * PAGE_SIZE;
+    request->m_readSize = cluster_info->page_count * PAGE_SIZE;
+    //request->m_buffer = buffer->data();
+    request->m_status = 63;
+    request->m_payload = (void*)cluster_info; 
+    request->m_success = false;
+    request->len = len;
+    request->D = D;
 
-    float* cluster_data = vec.data();
+    request->rerank_info.factor_fully = factor;
+    request->rerank_info.factor_partially = factor_partial;
+    request->rerank_info.heap_ids=heap_ids;
+    request->rerank_info.heap_sim=heap_sim;
+    request->rerank_info.list_ids = list_ids;
+    request->rerank_info.list_sim = list_sim;
+    request->rerank_info.k = res->k;
+    request->rerank_info.key = res->key;
+    request->rerank_info.query = query;
+    request->rerank_info.ids = res->ids;
 
-    // auto time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.disk_full_elapsed += time_end - time_start;
+    faiss::indexIVFPQDisk_stats.searched_vector_full+=request->len;
+    
+    //std::cout << " page_count: "<< cluster_info->page_count << " page_start: " << cluster_info->page_start << std::endl;
 
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
+    request->m_callback = [&](AsyncReadRequest* requested){
 
-    for (size_t i = 0; i < real_heap; i++) {
-        if (list_sim[i] < heap_sim[0] * factor) {
-            // if(res->check_repeat(list_ids[i]))
-            // continue;
+        //diskIOprocessor->test();
+        //std::cout << "len:" << len << " D:" << D <<" Request:" << requested->m_status << std::endl; 
+        //std::cout << "list_sim[0]:" << list_sim[0] << " factor:" << factor<<" Request:" << requested->m_status << std::endl; 
+        // for(int i = 0; i < 100; i++){
+        //     std::cout << reinterpret_cast<float*>(requested->m_buffer)[i] << std::endl;
+        // }
+        //
+        //std::vector<float> vec(D*len);
+        //void* buffer_disk = requested->m_buffer;
+        //std::cout << " begin call back " << std::endl;
+        KnnSearchResults<C, false> res_callback = {
+                /* key */ requested->rerank_info.key,
+                /* ids */ requested->rerank_info.ids,
+                /* sel */ nullptr,
+                /* k */ requested->rerank_info.k,
+                /* heap_sim */ requested->rerank_info.heap_sim,
+                /* heap_ids */ requested->rerank_info.heap_ids,
+                /* nup */ 0};
+        
+        // for(int i = 0; i < requested->rerank_info.k; i++){
+        //     std::cout << "i:" << i << "  heap_sim:" << requested->rerank_info.heap_sim[i] << std::endl;
+        // }
+        // std::cout << "\n\n\n\n\n";
 
-            float distance =
-                    fvec_L2sqr(query, cluster_data + list_ids[i] * D, D);
-            res->add(list_ids[i], distance);
-            // stats_rerank++;
+        idx_t* c_ids = requested->rerank_info.list_ids.get()->data();
+        float* c_sim = requested->rerank_info.list_sim.get()->data();
+
+        // std::cout << "Q:";
+        // for(int i = 0; i < 128; i++){
+        //     std::cout  <<requested->rerank_info.query[i] << "  ";
+        // }
+        // std::cout << std::endl;
+        // std::cout << "D:";
+        // for(int i = 0; i < 128; i++){
+        //     std::cout  <<(requested->converted_buffer + c_ids[0])[i] << "  ";
+        // }
+        // std::cout << std::endl << "dis=" << fvec_L2sqr_simd(requested->rerank_info.query, requested->converted_buffer + c_ids[0] * requested->D, requested->D);
+        // std::cout << std::endl;
+        // std::cout << std::endl;
+
+        //diskIOprocessor->convert_to_float(len, vec.data(), buffer_disk);     
+        for(size_t i = 0; i < requested->len; i++ ){
+            if (c_sim[i] < requested->rerank_info.heap_sim[0] * requested->rerank_info.factor_fully) {   // rerank
+                float distance = fvec_L2sqr_simd(requested->rerank_info.query, requested->converted_buffer + c_ids[i] * requested->D, requested->D);
+                res_callback.add(c_ids[i], distance);
+                // std::cout << "c_ids:"<<c_ids[i] << "   dis:"<< distance << std::endl;
+            }
         }
-        // stats_compare++;
-    }
+        //std::cout << "Call Back!!!!" << std::endl;
+    };
 
-    // time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
-
-    // indexIVFPQDisk_stats.full_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.full_cluster_compare += stats_compare;
+    // ******** Disk Process Begin **********
+    diskIOprocessor->disk_io_all_async(request);
+    // ******** Disk Process End   **********
+    //diskIOprocessor->submit(1);
 }
 
-template <class C, bool use_sel>
-void disk_partial_read(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
+namespace{
 
-        float factor,
-        float factor_partial,
+struct PageSegment {
+    int start_page;
+    int page_count;
+    std::vector<int> in_buffer_offsets;
+    std::vector<size_t> in_buffer_ids;
+    PageSegment() = default;
 
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
+    // 自定义构造函数，接受三个参数
+    PageSegment(int start, int count, const std::vector<int>& offsets, const std::vector<size_t>& ids)
+        : start_page(start), page_count(count), 
+            in_buffer_offsets(offsets), in_buffer_ids(ids) {}
+};
 
-        float* query,
-        int disk_fd // 传入文件描述符
-) {
+}// anonymous namespace
+
+template<class C, bool use_sel>
+void disk_partially_async(KnnSearchResults<C, use_sel>* res,
+                        int D,
+                        size_t len,
+                        size_t listno,
+                        Aligned_Cluster_Info* acInfo,
+
+
+                        float factor,
+                        float factor_partial,
+
+                        float* heap_sim,
+                        idx_t* heap_ids,
+
+                        std::shared_ptr<std::vector<float>>& list_sim,
+                        std::shared_ptr<std::vector<idx_t>>& list_ids,
+
+                        float* query,
+                        DiskIOProcessor* diskIOprocessor){
     int stats_compare = 0;
     int stats_rerank = 0;
-    std::vector<float> vec(D);
-    size_t offset = cluster_begin * single_offset;
-
-    for (size_t i = 0; i < real_heap; i++) {
-        if (list_sim[i] < heap_sim[0] * factor_partial) {
-            // auto time_start =
-            //         std::chrono::high_resolution_clock::now(); // time begin
-
-            // if(res->check_repeat(list_ids[i]))
-            // continue;
-
-            lseek(disk_fd, offset + list_ids[i] * single_offset, SEEK_SET);
-            ssize_t bytesRead = read(disk_fd, vec.data(), D * sizeof(float));
-            // auto time_end = std::chrono::high_resolution_clock::now();
-            // indexIVFPQDisk_stats.disk_partial_elapsed +=
-            //         time_end - time_start; // time end
-
-            // time_start =
-            //         std::chrono::high_resolution_clock::now(); // time begin
-
-            float distance = fvec_L2sqr(query, vec.data(), D);
-            res->add(list_ids[i], distance);
-            // stats_rerank++;
-
-            // time_end = std::chrono::high_resolution_clock::now(); // time end
-            // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
+    auto time_start = std::chrono::high_resolution_clock::now(); //time begin
+    std::shared_ptr<std::vector<int>> vector_to_search = std::make_shared<std::vector<int>>();
+    
+    //std::cout << "heap_sim[0] = " << heap_sim[0] << std::endl;
+    for(size_t i = 0; i < len; i++){
+        if (list_sim->data()[i] < heap_sim[0] * factor_partial){
+            vector_to_search->push_back(i);
         }
-
-        // stats_compare++;
     }
 
-    // indexIVFPQDisk_stats.partial_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.partial_cluster_compare += stats_compare;
+    // for(size_t i = 0; i < len; i++){
+    //     std::cout << list_sim->data()[i] << " ";
+    // }    
+
+    size_t vectors_num = vector_to_search->size();
+
+    //std::cout << "List_no:" << listno << "  pushed:" << vectors_num << " total:"<<len << "\n\n\n"<< std::endl;
+
+    // for(size_t i = 0; i < pages_num; i++){
+    //     //TODO Heap_sim is non_initialed
+    //     //std::cout << "VECTOR: " << vector_to_search->data()[i] << "  Heap_sim:" << heap_sim[0] << std::endl;
+    // }
+    //std::cout << "vectors_num:" << vectors_num << std::endl;
+
+    
+    std::shared_ptr<std::vector<int>> page_to_search = std::make_shared<std::vector<int>>(vectors_num);
+    std::unique_ptr<size_t> vec_page_proj(new size_t[vectors_num]);
+
+    int num_page_to_search = diskIOprocessor->process_page(vector_to_search->data(), page_to_search->data(), 
+                                                           vec_page_proj.get(), vectors_num);
+
+    // for(int i = 0; i < vectors_num; i++){
+    //     std::cout << "vector->" << i << "   id_rank:"<<vector_to_search->data()[i] <<
+    //               "  page: "<< vec_page_proj.get()[i] << std::endl; 
+    // }
+    
+    Aligned_Cluster_Info* cluster_info = &acInfo[listno];
+
+    // for(size_t i = 0; i < num_page_to_search; i++){
+
+    //     std::cout << "Total:" << cluster_info->page_count <<"    num_page_to_search:" << page_to_search->data()[i]<<std::endl;
+    // }
+
+
+
+    //auto buffer = std::make_shared<std::vector<char>>(cluster_info->page_count * diskIOprocessor->page_size);
+    //std::shared_ptr<std::vector<AsyncReadRequest_Partial>> request_p = std::make_shared<std::vector<AsyncReadRequest_Partial>>();
+    auto request_p = std::make_shared<std::vector<AsyncReadRequest_Partial>>();
+
+    const int per_page_element = diskIOprocessor->get_per_page_element();
+    //std::cout << "per_page_element:" << per_page_element << std::endl;
+    const int per_page_vector = per_page_element/D;
+    
+    // TODO 如果一个页面不能有整数个向量 要跨边界..
+    bool not_aligned = false;
+    if(per_page_element%D != 0)
+        not_aligned = true;
+
+    int begin_page = 0;
+    int record_begin_page = 0;
+
+    faiss::indexIVFPQDisk_stats.searched_vector_partial+=vectors_num;
+
+    if (num_page_to_search > 0) {
+        // 用于保存合并后的页信息
+        std::vector<PageSegment> merged_segments;
+        // 合并连续页
+        int start_page = page_to_search->at(0);
+        int page_count = 1;
+        std::vector<int> in_buffer_offsets;  //?
+        std::vector<size_t> in_buffer_ids;
+
+        int vec_rank = 0;
+        int page_rank = 0;
+        int* ptr_vector_to_search = vector_to_search->data();
+        int* ptr_page_to_search = page_to_search->data();
+        
+        // 第一个请求的开始读取的页面为
+        begin_page = ptr_page_to_search[0];
+        record_begin_page = ptr_page_to_search[0];
+        // for(int i = 0; i < num_page_to_search ;i++){
+        //     std::cout << "   num_page_to_search:"  << ptr_page_to_search[i] << std::endl;   
+        // }
+
+        //std::cout << "begin_page: "<<begin_page << "  record_begin_page:" <<record_begin_page << std::endl;
+        // 逐页添加
+        while (vec_rank<vectors_num && *(vec_page_proj.get() + vec_rank) == begin_page) {
+            int inbuffer = ptr_vector_to_search[vec_rank] * D - per_page_element * record_begin_page;
+            //std::cout << "record_begin_page:" << record_begin_page << " begin_page:" << begin_page<< std::endl; 
+            // std::cout << "Offset: " << inbuffer << " = " << ptr_vector_to_search[vec_rank] << "*"<< D 
+            //          << "-" << per_page_element << "*" << record_begin_page 
+            //          << " ptr_vector_to_search->" <<vec_rank << " "<<ptr_vector_to_search[vec_rank]  << std::endl; 
+            //std::cout << "Offset: " << inbuffer << std::endl;
+            in_buffer_offsets.emplace_back(inbuffer);
+            //TODO
+            in_buffer_ids.emplace_back(ptr_vector_to_search[vec_rank]);
+            vec_rank++;
+        }
+        page_rank++;
+
+        for (int i = 1; i < num_page_to_search; ++i) {
+            int current_page = page_to_search->at(i);
+            int previous_page = page_to_search->at(i - 1);
+
+            if (current_page == previous_page + 1) {
+                // 如果是连续的页，增加页数
+                page_count++;
+                begin_page = ptr_page_to_search[page_rank];
+                //?????
+                while ( vec_rank<vectors_num && *(vec_page_proj.get() + vec_rank) == begin_page) {
+                    int inbuffer = ptr_vector_to_search[vec_rank] * D - per_page_element * record_begin_page;
+                    
+                    //std::cout << "record_begin_page:" << record_begin_page << " begin_page:" << begin_page << std::endl; 
+                    // std::cout << "Offset: " << inbuffer << " = " << ptr_vector_to_search[vec_rank] << "*"<< D 
+                    //  << "-" << per_page_element << "*" << record_begin_page  
+                    //  << " ptr_vector_to_search->" <<vec_rank << " "<<ptr_vector_to_search[vec_rank]  << std::endl; 
+                    //std::cout << "Offset: " << inbuffer << std::endl;
+                    in_buffer_offsets.emplace_back(inbuffer);
+                    in_buffer_ids.emplace_back(ptr_vector_to_search[vec_rank]);
+                    vec_rank++;
+                }
+                page_rank++;
+            } else {
+                // 保存当前合并段
+                merged_segments.emplace_back(start_page, page_count, in_buffer_offsets, in_buffer_ids);
+
+                // 重新初始化新的合并段
+                start_page = current_page;
+                page_count = 1;
+                in_buffer_offsets.clear();
+                in_buffer_ids.clear();
+                record_begin_page = ptr_page_to_search[page_rank];
+                begin_page = ptr_page_to_search[page_rank];
+                
+                while (vec_rank<vectors_num && *(vec_page_proj.get() + vec_rank) == begin_page) {
+                    
+                    int inbuffer = ptr_vector_to_search[vec_rank] * D - per_page_element * record_begin_page;
+                    //std::cout << "record_begin_page:" << record_begin_page << " begin_page:" << begin_page << std::endl; 
+                    // std::cout << "Offset: " << inbuffer << " = " << ptr_vector_to_search[vec_rank] << "*"<< D 
+                    //  << "-" << per_page_element << "*" << record_begin_page 
+                    //  << " ptr_vector_to_search->" <<vec_rank << " "<<ptr_vector_to_search[vec_rank]  << std::endl; 
+                    //std::cout << "Offset: " << inbuffer << std::endl;
+                    in_buffer_offsets.emplace_back(inbuffer);
+                    in_buffer_ids.emplace_back(ptr_vector_to_search[vec_rank]);
+                    vec_rank++;
+                }
+                page_rank++;
+            }
+        }
+        // 添加最后一个合并段
+        merged_segments.emplace_back(start_page, page_count, in_buffer_offsets, in_buffer_ids);
+
+        // for(int i = 0; i < merged_segments.size(); i++){
+        //     std::cout << " START_PAGE: " << merged_segments[i].start_page << std::endl;
+        //     std::cout << " PAGE_COUNT: " << merged_segments[i].page_count << std::endl;
+        //     for(int j = 0; j < merged_segments[i].in_buffer_offsets.size(); j++){
+        //         std::cout <<"   offsets: " << merged_segments[i].in_buffer_offsets[j] << std::endl;
+        //         std::cout <<"   ids    : " << merged_segments[i].in_buffer_ids[j] << std::endl;
+        //     }
+        // }
+        // std::cout << std::endl;
+
+        size_t global_start = cluster_info->page_start;
+
+        // 第二步：调整 request_p 的大小，并初始化每个请求
+        request_p->resize(merged_segments.size());
+        for (size_t i = 0; i < merged_segments.size(); ++i) {
+            const auto& segment = merged_segments[i];
+            AsyncReadRequest_Partial& request = (*request_p)[i];
+            //request.m_offset = (global_start + segment.start_page) * diskIOprocessor->page_size;
+            //request.m_readSize = segment.page_count * diskIOprocessor->page_size;
+
+            request.m_offset = (global_start + segment.start_page) * PAGE_SIZE;
+            request.m_readSize = segment.page_count * PAGE_SIZE;
+            request.D = D;
+            request.in_buffer_offsets = segment.in_buffer_offsets;
+            request.in_buffer_ids = segment.in_buffer_ids;
+            
+            //**************  request information begin ******************
+            // 
+            request.rerank_info.factor_fully = factor;
+            request.rerank_info.factor_partially = factor_partial;
+            request.rerank_info.heap_ids=heap_ids;
+            request.rerank_info.heap_sim=heap_sim;
+            request.rerank_info.list_ids = list_ids;
+            request.rerank_info.list_sim = list_sim;
+            request.rerank_info.k = res->k;
+            request.rerank_info.key = res->key;
+            request.rerank_info.query = query;
+            request.rerank_info.ids = res->ids;
+            //**************  request information end ******************
+
+            request.m_callback_calculation = [&](AsyncReadRequest_Partial* requested, 
+                                                std::vector<float>& global_dis, std::vector<size_t>& global_ids){
+                
+                int* element_offsets = requested->in_buffer_offsets.data();
+                size_t* element_ids = requested->in_buffer_ids.data();
+                float distance;
+
+                // std::cout << "Q:";
+                // for(int i = 0; i < 128; i++){
+                //     std::cout  <<requested->rerank_info.query[i] << "  ";
+                // }
+                // std::cout << std::endl;
+                // std::cout << "D:";
+                // for(int i = 0; i < 128; i++){
+                //     std::cout  <<(requested->converted_buffer + element_offsets[0])[i] << "  ";
+                // }
+                // std::cout << std::endl << "dis=" << fvec_L2sqr_simd(requested->rerank_info.query, requested->converted_buffer + element_offsets[0] * requested->D, requested->D);
+                // std::cout << std::endl;
+                // std::cout << std::endl;
+
+                for(int i = 0; i < requested->in_buffer_offsets.size(); i++){
+                    distance = fvec_L2sqr_simd(requested->rerank_info.query, requested->converted_buffer + element_offsets[i], requested->D);
+                    //distance = fvec_L2sqr_simd(requested->converted_buffer + element_offsets[0], requested->converted_buffer + element_offsets[i], requested->D);
+                    //distance = fvec_L2sqr_simd(requested->rerank_info.query, requested->rerank_info.query, requested->D);
+                    
+                    //std::cout << "Key:"  << requested->rerank_info.key<< "  element_offsets:" <<  element_offsets[i] <<"  ID:" << element_ids[i] <<"   DIS:" << distance << std::endl;
+                    //std::cout << element_offsets[i] << " ";
+                    // 需要一个地方有存储的ID？ 
+                    global_ids.emplace_back(element_ids[i]);
+                    global_dis.emplace_back(distance);
+                }
+
+                //std::cout << "\n";
+            };
+
+            request.m_callback = [&](AsyncReadRequest_Partial* requested,
+                                      std::vector<float>& global_dis, std::vector<size_t>& global_ids){
+                KnnSearchResults<C, false> res_callback = {
+                        /* key */ requested->rerank_info.key,
+                        /* ids */ requested->rerank_info.ids,
+                        /* sel */ nullptr,
+                        /* k */ requested->rerank_info.k,
+                        /* heap_sim */ requested->rerank_info.heap_sim,
+                        /* heap_ids */ requested->rerank_info.heap_ids,
+                        /* nup */ 0};
+                // for(size_t i = 0; i < global_dis.size(); i++ ){
+                //     std::cout << " global_ids->i: " << global_ids[i]<< "  global_dis[i]:" <<  global_dis[i] << std::endl;
+                // }
+                // for(size_t i = 0; i <requested->rerank_info.k; i++ ){
+                //     std::cout << " heap_sim->i: " << requested->rerank_info.heap_sim[i]<< 
+                //     "  heap_ids[i]:" <<  requested->rerank_info.heap_ids[i] << std::endl;
+                // }
+
+                for(size_t i = 0; i < global_dis.size(); i++ ){
+                    res_callback.add(global_ids[i], global_dis[i]);
+                }
+                
+            };
+        }
+
+        // 提交请求
+        diskIOprocessor->disk_io_partial_async(request_p);
+    }
 }
 
-// mmap not all
-template <class C, bool use_sel>
-void disk_full_mmap(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
 
-        float factor,
-        float factor_partial,
-
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
-
-        float* query,
-        int disk_fd // 传入文件描述符
-) {
-    int stats_compare = 0;
-    int stats_rerank = 0;
-
-    // auto time_start = std::chrono::high_resolution_clock::now(); // time begin
-
-    size_t begin_offset = cluster_begin * single_offset;
-    size_t len_offset = len * single_offset;
-    // computing the starting point of mapping and the page alignment
-    size_t aligned_begin_offset = begin_offset & ~(sysconf(_SC_PAGE_SIZE) - 1);
-
-    // the length of mapping(ensure enough data)
-    size_t map_length = len_offset + (begin_offset - aligned_begin_offset);
-
-    // mmap
-    void* mapped_data =
-            mmap(nullptr,
-                 map_length,
-                 PROT_READ,
-                 MAP_PRIVATE,
-                 disk_fd,
-                 aligned_begin_offset);
-    if (mapped_data == MAP_FAILED) {
-        throw std::runtime_error("Failed to map file");
-    }
-
-    // data pointer
-    float* cluster_data = static_cast<float*>(mapped_data) +
-            (begin_offset - aligned_begin_offset) / sizeof(float);
-
-    // auto time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.disk_full_elapsed += time_end - time_start;
-
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
-
-    for (size_t i = 0; i < real_heap; i++) {
-        if (list_sim[i] < heap_sim[0] * factor) {
-            // if(res->check_repeat(list_ids[i]))
-            // continue;
-
-            float distance =
-                    fvec_L2sqr(query, cluster_data + list_ids[i] * D, D);
-            res->add(list_ids[i], distance);
-            // stats_rerank++;
-        }
-        // stats_compare++;
-    }
-
-    // time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
-
-    // indexIVFPQDisk_stats.full_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.full_cluster_compare += stats_compare;
-
-    // unmap
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
-    munmap(mapped_data, map_length);
-    // time_end = std::chrono::high_resolution_clock::now(); // time end
-    // indexIVFPQDisk_stats.disk_full_elapsed += time_end - time_start;
-}
-
-template <class C, bool use_sel>
-void disk_partial_mmap(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
-
-        float factor,
-        float factor_partial,
-
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
-
-        float* query,
-        int disk_fd
-
-) {
-    int stats_compare = 0;
-    int stats_rerank = 0;
-    // auto time_start = std::chrono::high_resolution_clock::now(); // time begin
-    size_t begin_offset = cluster_begin * single_offset;
-    size_t len_offset = len * single_offset;
-    // computing the starting point of mapping and the page alignment
-    size_t aligned_begin_offset = begin_offset & ~(sysconf(_SC_PAGE_SIZE) - 1);
-
-    // the length of mapping(ensure enough data)
-    size_t map_length = len_offset + (begin_offset - aligned_begin_offset);
-
-    // 执行 mmap 操作
-    void* mapped_data =
-            mmap(nullptr,
-                 map_length,
-                 PROT_READ,
-                 MAP_PRIVATE,
-                 disk_fd,
-                 aligned_begin_offset);
-    if (mapped_data == MAP_FAILED) {
-        throw std::runtime_error("Failed to map file");
-    }
-
-    float* cluster_data = static_cast<float*>(mapped_data) +
-            (begin_offset - aligned_begin_offset) / sizeof(float);
-    // auto time_end = std::chrono::high_resolution_clock::now();
-    // indexIVFPQDisk_stats.disk_partial_elapsed +=
-    //         time_end - time_start; // time end
-
-    std::vector<float> vec(D);
-    for (size_t i = 0; i < real_heap; i++) {
-        if (list_sim[i] < heap_sim[0] * factor_partial) {
-            // auto time_start =
-            //         std::chrono::high_resolution_clock::now(); // time begin
-
-            // if(res->check_repeat(list_ids[i]))
-            // continue;
-
-            float* data_ptr = cluster_data + list_ids[i] * D;
-            std::memcpy(vec.data(), data_ptr, D * sizeof(float));
-
-            // auto time_end = std::chrono::high_resolution_clock::now();
-            // indexIVFPQDisk_stats.disk_partial_elapsed +=
-            //         time_end - time_start; // time end
-
-            // time_start =
-            //         std::chrono::high_resolution_clock::now(); // time begin
-
-            float distance = fvec_L2sqr(query, vec.data(), D);
-            res->add(list_ids[i], distance);
-            // stats_rerank++;
-
-            // time_end = std::chrono::high_resolution_clock::now(); // time end
-            // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start;
-        }
-
-        // stats_compare++;
-    }
-
-    // indexIVFPQDisk_stats.partial_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.partial_cluster_compare += stats_compare;
-    // // unmap
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
-    munmap(mapped_data, map_length);
-    // time_end = std::chrono::high_resolution_clock::now();
-    // indexIVFPQDisk_stats.disk_partial_elapsed +=
-    //         time_end - time_start; // time end
-}
-
-// mmap all
-template <class C, bool use_sel>
-void disk_all_mmap(
-        KnnSearchResults<C, use_sel>* res,
-        int D,
-        size_t len,
-        size_t cluster_begin,
-        size_t single_offset,
-        int real_heap,
-
-        float factor,
-        float factor_partial,
-
-        float* heap_sim,
-        float* list_sim,
-        idx_t* list_ids,
-
-        float* query,
-        void* mapped_data
-
-) {
-    int stats_compare = 0;
-    int stats_rerank = 0;
-    // auto time_start = std::chrono::high_resolution_clock::now(); // time begin
-    size_t begin_offset = cluster_begin * single_offset;
-    size_t len_offset = len * single_offset;
-
-    float* cluster_data = static_cast<float*>(mapped_data) + cluster_begin * D;
-    // auto time_end = std::chrono::high_resolution_clock::now();
-    // indexIVFPQDisk_stats.disk_partial_elapsed +=
-    //         time_end - time_start; // time end
-
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
-    // new version: compute precise distance by batch
-    // 1. record postions of the vector to be calculated
-    std::vector<size_t> positions(len);
-    size_t* p_pos = positions.data();
-    size_t* p_begin = p_pos;
-    // 2. find the smaller one of threshold
-    float threshold =
-            C::cmp(list_sim[0], heap_sim[0]) ? heap_sim[0] : list_sim[0];
-    // 3. record vectors number
-    size_t vec_num = 0;
-
-    for (size_t i = 0; i < real_heap; i++) {
-        if (list_sim[i] < threshold * factor) {
-            *p_pos = i;
-            p_pos++;
-            vec_num++;
-            // stats_rerank++;
-        }
-        // stats_compare++;
-    }
-
-    // time_end = std::chrono::high_resolution_clock::now();
-    // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start; // time end
-
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
-    std::vector<float> vec_data(D * vec_num);
-    float* data_ptr;
-    size_t* data_pos = positions.data();
-    for (size_t j = 0; j < vec_num; j++) {
-        data_ptr = cluster_data + data_pos[j] * D;
-        std::memcpy(vec_data.data() + j * D, data_ptr, D * sizeof(float));
-        // std::cout << (float)j/vec_num << " ";
-        // std::cout << "j:" <<data_pos[j] << " len:" << len << std::endl;
-    }
-    // time_end = std::chrono::high_resolution_clock::now();
-    // indexIVFPQDisk_stats.disk_full_elapsed += time_end - time_start; // time end
-    // time_start = std::chrono::high_resolution_clock::now(); // time begin
-
-    std::vector<float> distances(vec_num);
-    float* p_dis = distances.data();
-    std::vector<size_t> temp_pos(vec_num);
-    for (int i = 0; i < vec_num; i++) {
+// if warmed up
+template<class C, bool use_sel>
+void memory_all_scan(KnnSearchResults<C, use_sel>* res, 
+                        int D, 
+                        const float* vec_data, 
+                        float* query, 
+                        const idx_t* list_ids, 
+                        size_t len){
+    std::vector<size_t> temp_pos(len);
+    for(int i = 0; i < len; i++){
         temp_pos[i] = i;
     }
+    std::vector<float> distances(len);
+    float* p_dis = distances.data();
 
-    compute_precise_dis_simd(
-            query,
-            vec_data.data(),
-            temp_pos.data(),
-            D,
-            distances.data(),
-            vec_num);
-
-    for (size_t i = 0; i < vec_num; i++) {
-        res->add(list_ids[p_begin[i]], p_dis[i]);
+    compute_precise_dis_simd(query, vec_data, temp_pos.data(), D, distances.data(),len);
+    for(size_t i = 0; i < len; i++){
+        res->add(i, p_dis[i]);
+        //std::cout <<"i:" <<i<<"list_ids[i]:" << list_ids[i] << " distance:"<<distances.data()[i] << std::endl;
+        // if(distances.data()[i] > 1000000)
+        // {
+        //     for(int j = 0; j < D; j++){
+        //         std::cout << *(vec_data + i*D +j) << " ";
+        //     }
+        //     std::cout<< std::endl;
+        // }
     }
-    // time_end = std::chrono::high_resolution_clock::now();
-    // indexIVFPQDisk_stats.memory_2_elapsed += time_end - time_start; // time end
-
-    // indexIVFPQDisk_stats.partial_cluster_rerank += stats_rerank;
-    // indexIVFPQDisk_stats.partial_cluster_compare += stats_compare;
 }
 
-} // namespace
+template<class C, bool use_sel>
+void memory_selective_scan(
+    KnnSearchResults<C, use_sel>* res, 
+        int D, 
+        const float* vec_data, 
+        float* query, 
+        float* list_sim,
+        const idx_t* list_ids,
+        float* heap_sim,
+        size_t len, 
+        float factor){
+    // std::vector<size_t> positions(len);
+    // size_t* p_pos = positions.data();
+    // size_t* p_begin = p_pos;
+    // // 2. find the smaller one of threshold
+    // float threshold = C::cmp(list_sim[0],heap_sim_0)?heap_sim_0:list_sim[0];
+    // // 3. record vectors number 
+    // size_t vec_num = 0;
+
+    // for(size_t i = 0; i < len; i++ ){
+    //     if (list_sim[i] < threshold * factor) {
+    //         *p_pos = i;
+    //         p_pos++;
+    //         vec_num++;
+    //     }
+    // }
+    
+    // std::vector<float> distances(vec_num);
+    // float* p_dis = distances.data();
+    // std::vector<size_t> temp_pos(vec_num);
+    // for(int i = 0; i < vec_num; i++){
+    //     temp_pos[i] = i;
+    // }
+
+    // compute_precise_dis_batch(query, vec_data, temp_pos.data(), D, distances.data(),vec_num);
+    
+    // for(size_t i = 0; i < vec_num; i++){
+    //     res->add(list_ids[p_begin[i]], p_dis[i]);
+    // }
+    for (size_t i = 0; i < len; i++) {
+        if (list_sim[i] < heap_sim[0] * factor) {
+            float distance = fvec_L2sqr_simd(query, vec_data + i*D, D);
+            res->add(i, distance);
+            //std::cout << "list_ids[i]:" << list_ids[i] << " distance:"<<distance << std::endl;
+        }
+     }
+}
+
+}
 
 /* We put as many parameters as possible in template. Hopefully the
  * gain in runtime is worth the code bloat.
@@ -2525,108 +2625,66 @@ void disk_all_mmap(
  *
  * use_sel: store or ignore the IDSelector
  */
-// #define DISK_READ
-#define DISK_FREAD
-// #define DISK_MMAP
-// #define DISK_IFSTREAM
-// #define DISK_MMAP_ALL
+//#define DISK_READ
+//#define DISK_FREAD
+//#define DISK_MMAP
+//#define DISK_IFSTREAM
+//#define DISK_MMAP_ALL
 
 template <MetricType METRIC_TYPE, class C, class PQDecoder, bool use_sel>
 struct IVFPQDiskScanner : IVFPQDiskScannerT<idx_t, METRIC_TYPE, PQDecoder>,
-                          InvertedListScanner {
+                      InvertedListScanner {
     int precompute_mode;
     const IDSelector* sel;
-    float* raw_query = nullptr;
+    float* raw_query  = nullptr;
 
-#ifdef DISK_IFSTREAM
-    mutable std::ifstream disk_data; // ifsream
-
-#elif defined(DISK_FREAD)
-    mutable FILE* disk_data = nullptr; // fread
-#elif defined(DISK_MMAP_ALL)
-    int disk_fd = -1; // file desciptor
-    size_t file_size = 0;
-    void* disk_data = nullptr; // mapped_data
-#else
-    int disk_data = -1; // read or mmap
+#ifdef DISK_FREAD
+    mutable FILE* disk_data = nullptr;    // fread
 #endif
+    
+    //std::unique_ptr<DiskIOProcessor> diskIOprocessor;
+    //std::shared_ptr<DiskIOProcessor> diskIOprocessor;
+    DiskIOProcessor* diskIOprocessor;
 
     IVFPQDiskScanner(
             const IndexIVFPQDisk& ivfpq_disk,
             bool store_pairs,
             int precompute_mode,
             const IDSelector* sel)
-            : IVFPQDiskScannerT<idx_t, METRIC_TYPE, PQDecoder>(
-                      ivfpq_disk,
-                      nullptr),
-              precompute_mode(precompute_mode),
-              sel(sel) {
-#ifdef DISK_IFSTREAM
-        this->disk_data.open(ivfpq_disk.get_disk_path(), std::ios::binary);
-        if (!disk_data.is_open()) {
-            throw std::runtime_error(
-                    "IVFPQDiskScanner: Failed to open disk file for reading");
-        }
-#elif defined(DISK_FREAD)
+            : IVFPQDiskScannerT<idx_t, METRIC_TYPE, PQDecoder>(ivfpq_disk, nullptr),
+              precompute_mode(precompute_mode),sel(sel) {
+#ifdef DISK_FREAD
         disk_data = fopen(ivfpq_disk.get_disk_path().c_str(), "rb");
         if (!disk_data) {
-            throw std::runtime_error(
-                    "IVFPQDiskScanner: Failed to open disk file for reading");
+            throw std::runtime_error("IVFPQDiskScanner: Failed to open disk file for reading");
         }
-#elif defined(DISK_MMAP_ALL)
-        disk_fd = open(ivfpq_disk.get_disk_path().c_str(), O_RDONLY);
-        if (disk_fd == -1) {
-            throw std::runtime_error(
-                    "IVFPQDiskScanner: Failed to open disk file for reading");
-        }
-
-        struct stat sb;
-        if (fstat(disk_fd, &sb) == -1) {
-            throw std::runtime_error(
-                    "IVFPQDiskScanner: Failed to get file size");
-        }
-        file_size = sb.st_size;
-
-        disk_data =
-                mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, disk_fd, 0);
-        if (disk_data == MAP_FAILED) {
-            throw std::runtime_error("IVFPQDiskScanner: Failed to map file");
-        }
-
-#else
-        disk_data = open(ivfpq_disk.get_disk_path().c_str(), O_RDONLY);
 #endif
+        // diskIOprocessor.reset(ivfpq_disk.get_DiskIOSearchProcessor());
+        // diskIOprocessor.get()->initial();
+        diskIOprocessor = ivfpq_disk.get_DiskIOSearchProcessor();
+        diskIOprocessor->initial();  // 使用箭头操作符访问成员函数
 
         this->store_pairs = store_pairs;
         this->keep_max = is_similarity_metric(METRIC_TYPE);
     }
-
+    
     ~IVFPQDiskScanner() {
-#ifdef DISK_IFSTREAM
-        if (disk_data)
-            disk_data.close(); // ifstream
-#elif defined(DISK_FREAD)
-        if (disk_data)
-            fclose(disk_data); // fread
-#elif defined(DISK_MMAP_ALL)
-        if (disk_data && disk_data != MAP_FAILED) {
-            munmap(disk_data, file_size);
-        }
-        if (disk_fd != -1) {
-            close(disk_fd);
-        }
-#else
-        if (disk_data != -1) ///> read or mmap
-            close(disk_data);
+#ifdef DISK_FREAD
+    if (disk_data)        
+            fclose(disk_data);    // fread
 #endif
     }
 
+    void async_submit(int num) override{
+        //std::cout << "Ready to submit: " << num << std::endl;
+        diskIOprocessor->submit(num);
+    }
+
     void set_query(const float* query) override {
-        this->raw_query = const_cast<float*>(
-                query); // ? const seems to be not very suitable here
+        this->raw_query = const_cast<float*>(query);   // ? const seems to be not very suitable here
         this->init_query(query);
         // reset hashtable
-        // this->visited.clear();
+        //this->visited.clear();
     }
 
     void set_list(idx_t list_no, float coarse_dis) override {
@@ -2649,6 +2707,7 @@ struct IVFPQDiskScanner : IVFPQDiskScannerT<idx_t, METRIC_TYPE, PQDecoder>,
             float* heap_sim,
             idx_t* heap_ids,
             size_t k) const override {
+
         KnnSearchResults<C, use_sel> res = {
                 /* key */ this->key,
                 /* ids */ this->store_pairs ? nullptr : ids,
@@ -2658,60 +2717,53 @@ struct IVFPQDiskScanner : IVFPQDiskScannerT<idx_t, METRIC_TYPE, PQDecoder>,
                 /* heap_ids */ heap_ids,
                 /* nup */ 0};
 
-        // auto time_start =
-        //         std::chrono::high_resolution_clock::now(); // time begin
-        //     : 1. 先扫描计算一个聚类(list)中的全部PQ码,得到每个向量的大概距离
-        //       2. 把这些大概距离放进堆里面
-        //       3. 从磁盘读取向量
-        //          a. 根据边界值(largest distance *
-        //          estimated_factor)来确定从磁盘提取多少向量
-        //       or b. 将一个聚类的向量全部读入
-        //       4.  计算读取的向量和query的距离，然后放进结果heap中
+        auto time_start = std::chrono::high_resolution_clock::now();      // time begin
+        size_t list_code_num = this->ivfpq_disk.invlists->list_size(this->list_no);
+        const idx_t* list_entry = this->ivfpq_disk.invlists->get_ids(this->list_no);   // check whether an entry has been scanned
+        
+        // store local result
+        //std::vector<float> list_sim(list_code_num);
+        //std::vector<idx_t> list_ids(list_code_num);
+        std::shared_ptr<std::vector<float>> list_sim = std::make_shared<std::vector<float>>(list_code_num);
+        std::shared_ptr<std::vector<idx_t>> list_ids = std::make_shared<std::vector<idx_t>>(list_code_num);
 
-        // 获取当前聚类(list)的向量数量、PQ码及其对应的id
-        size_t list_code_num =
-                this->ivfpq_disk.invlists->list_size(this->list_no);
-        // const idx_t* list_entry = this->ivfpq_disk.invlists->get_ids(
-        //         this->list_no); // check whether an entry has been scanned
-        std::vector<float> list_sim(list_code_num);
-        std::vector<idx_t> list_ids(list_code_num);
-
-        // 根据内积IP和欧式距离来确定用最大堆还是最小堆
         if (this->ivfpq_disk.metric_type == METRIC_INNER_PRODUCT) {
-            heap_heapify<HeapForIP>(
-                    list_code_num, list_sim.data(), list_ids.data());
+            heap_heapify<HeapForIP>(list_code_num, list_sim->data(), list_ids->data());
         } else {
-            heap_heapify<HeapForL2>(
-                    list_code_num, list_sim.data(), list_ids.data());
+            heap_heapify<HeapForL2>(list_code_num, list_sim->data(), list_ids->data());
         }
 
-        // 实际扫描的PQ码里个数：
-        // Faiss
-        // 库中的scanner有根据ID来忽略一些向量的机制。所以KnnSearchResults有可能会跳过一些id，heap里的元素个数可能会比list_code_num少
         int real_heap = 0;
 
-        // estimate_factor
         float factor = this->ivfpq_disk.get_estimate_factor();
         float factor_partial = this->ivfpq_disk.get_estimate_factor_partial();
 
-        // auto time_end = std::chrono::high_resolution_clock::now(); // time end
-        // indexIVFPQDisk_stats.others_elapsed += time_end - time_start;
+        auto time_end = std::chrono::high_resolution_clock::now();       // time end
+        indexIVFPQDisk_stats.others_elapsed += time_end - time_start;
+        
+        int is_cached = this->ivfpq_disk.diskInvertedListHolder.is_cached(this->list_no);
+        if(is_cached >= 0){
+            indexIVFPQDisk_stats.cached_list_access++;
+            if(this->load_strategy == FULLY){
+                const float* vecs = reinterpret_cast<const float*>(this->ivfpq_disk.diskInvertedListHolder.get_cache_data(is_cached));
+                //std::cout << "In cache:"<<this->ivfpq_disk.diskInvertedListHolder.clusters_length[is_cached];
+                //std::cout << " Acctually:" << list_code_num << std::endl;
+                //std::cout << "cached:" << is_cached << " block" << std::endl;
+                memory_all_scan(&res, this->ivfpq_disk.get_dim(), vecs, raw_query,list_entry,list_code_num);
+                //std::cout << "scan finished"<< std::endl;
+                return res.nup;
+            }
+            
+        }
 
-        // time_start = std::chrono::high_resolution_clock::now(); // time begin
-
-        // 对PQ码进行扫描（目前只实现了precompute_mode == 2的情况）
+        time_start = std::chrono::high_resolution_clock::now();      // time begin
+            
         if (this->polysemous_ht > 0) {
             assert(precompute_mode == 2);
             this->scan_list_polysemous(ncode, codes, res);
         } else if (precompute_mode == 2) {
-            real_heap = this->scan_list_with_table(
-                    ncode,
-                    codes,
-                    list_sim.data(),
-                    list_ids.data(),
-                    k,
-                    res);
-            // this->scan_list_with_table(ncode, codes, res);
+            real_heap = this->scan_list_with_table(ncode, codes, list_sim->data(), list_ids->data(),
+                                                    heap_ids, list_entry, k, res);
         } else if (precompute_mode == 1) {
             this->scan_list_with_pointer(ncode, codes, res);
         } else if (precompute_mode == 0) {
@@ -2720,104 +2772,59 @@ struct IVFPQDiskScanner : IVFPQDiskScannerT<idx_t, METRIC_TYPE, PQDecoder>,
             FAISS_THROW_MSG("bad precomp mode");
         }
 
-        // time_end = std::chrono::high_resolution_clock::now(); // time end
-        // indexIVFPQDisk_stats.memory_1_elapsed += time_end - time_start;
+        time_end = std::chrono::high_resolution_clock::now();       // time end
+        indexIVFPQDisk_stats.memory_1_elapsed += time_end - time_start;
 
-        // 获得PQ的距离，并放进堆中
-        if (real_heap != 0) {
-            // 定位该聚类list在磁盘中的位置（数据在磁盘中按聚类顺序存储）
-            size_t cluster_begin =
-                    this->ivfpq_disk.get_cluster_location(this->key);
+        if(is_cached >= 0 && load_strategy == PARTIALLY){
+            std::cout << "Cache Scan!" << std::endl;
+            const float* vecs = reinterpret_cast<const float*>(this->ivfpq_disk.diskInvertedListHolder.get_cache_data(is_cached));
+            memory_selective_scan(&res, 
+                                    this->ivfpq_disk.get_dim(),
+                                    vecs, 
+                                    raw_query,
+                                    list_sim->data(),
+                                    list_entry,
+                                    heap_sim,
+                                    list_code_num,
+                                    factor_partial);
+            return res.nup;
+        }
+
+        if(real_heap != 0){
+            size_t cluster_begin = this->ivfpq_disk.get_cluster_location(this->key);
             size_t len = this->ivfpq_disk.get_cluster_len(this->key);
             size_t single_offset = this->ivfpq_disk.get_vector_offset();
             int D = this->ivfpq_disk.get_dim();
             float* query = raw_query;
 
-            // use it to judge whether a vector need to be re-rank
-            // in partial mode
-            // float temp_result = list_sim[0];
-
             if (this->load_strategy == FULLY) {
-#ifdef DISK_IFSTREAM
-                disk_full_ifs(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
-#elif defined(DISK_FREAD)
-                disk_full_fread(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
-#elif defined(DISK_MMAP)
-                disk_full_mmap(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
-#elif defined(DISK_MMAP_ALL)
-                disk_all_mmap(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
+#ifdef USING_SYNC
+                disk_fully_process(&res, D, len,
+                                    list_no,
+                                    this->ivfpq_disk.aligned_cluster_info,
+                                    factor,
+                                    factor_partial,
+                                    heap_sim,
+                                    list_sim.data(),
+                                    list_ids.data(),
+                                    query,
+                                    this->diskIOprocessor.get());
 #else
-                disk_full_read(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
+                disk_fully_async(&res, D, len,
+                                list_no,
+                                this->ivfpq_disk.aligned_cluster_info,
+                                factor,
+                                factor_partial,
+                                heap_sim,
+                                heap_ids,
+                                list_sim,
+                                list_ids,
+                                query,
+                                this->diskIOprocessor);           
 #endif
-            } else {
-#ifdef DISK_IFSTREAM
-                disk_partial_ifs(
-                        &res,
+        
+#ifdef USING_SYNC
+        disk_full_fread(&res,
                         D,
                         len,
                         cluster_begin,
@@ -2830,68 +2837,47 @@ struct IVFPQDiskScanner : IVFPQDiskScannerT<idx_t, METRIC_TYPE, PQDecoder>,
                         list_ids.data(),
                         query,
                         this->disk_data);
-#elif defined(DISK_FREAD)
-                disk_partial_fread(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
-#elif defined(DISK_MMAP)
-                disk_partial_mmap(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
-#elif defined(DISK_MMAP_ALL)
-                disk_all_mmap(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
+
+    
+#endif
+    } else {
+        // disk_partially_process(&res, D, len,list_no,
+        //                         this->ivfpq_disk.aligned_cluster_info,
+        //                         factor,
+        //                         factor_partial,
+        //                         heap_sim,
+        //                         list_sim.data(),
+        //                         list_ids.data(),
+        //                         query,
+        //                         this->diskIOprocessor.get());
+#ifdef USING_SYNC
+        disk_partial_fread(&res,
+                           D,
+                           len,
+                           cluster_begin,
+                           single_offset,
+                           real_heap,
+                           factor,
+                           factor_partial,
+                           heap_sim,
+                           list_sim.data(),
+                           list_ids.data(),
+                           query,
+                           this->disk_data);
 #else
-                disk_partial_read(
-                        &res,
-                        D,
-                        len,
-                        cluster_begin,
-                        single_offset,
-                        real_heap,
-                        factor,
-                        factor_partial,
-                        heap_sim,
-                        list_sim.data(),
-                        list_ids.data(),
-                        query,
-                        this->disk_data);
+        disk_partially_async(&res, D, len,
+                                    list_no,
+                                    this->ivfpq_disk.aligned_cluster_info,
+                                    factor,
+                                    factor_partial,
+                                    heap_sim,
+                                    heap_ids,
+                                    list_sim,
+                                    list_ids,
+                                    query,
+                                    this->diskIOprocessor);  
 #endif
-            }
+    }
         }
         return res.nup;
     }
@@ -2974,6 +2960,54 @@ InvertedListScanner* IndexIVFPQDisk::get_InvertedListScanner(
     }
     return nullptr;
 }
+namespace{
+
+    template <typename ValueType>
+    DiskIOProcessor* get_DiskIOBuildProcessor_2(std::string& disk_path, size_t d, size_t ntotal){
+        return new IVF_DiskIOBuildProcessor<ValueType>(disk_path, d, ntotal);
+
+    }
+
+
+    template <typename ValueType>
+    DiskIOProcessor* get_DiskIOSearchProcessor_2(const std::string& disk_path, const size_t d) {
+    #ifndef USING_ASYNC
+        return new IVF_DiskIOSearchProcessor<ValueType>(disk_path, d);
+    #else 
+        return new IVF_DiskIOSearchProcessor_Async<ValueType>(disk_path, d);
+    #endif
+    }
+}
+
+
+
+DiskIOProcessor* IndexIVFPQDisk::get_DiskIOBuildProcessor() {
+
+    if(this->valueType == "float"){
+         return get_DiskIOBuildProcessor_2<float>(this->disk_path, d, ntotal);
+    }else if(this->valueType == "uint8"){
+        return get_DiskIOBuildProcessor_2<uint8_t>(this->disk_path, d, ntotal);
+    }else if(this->valueType == "int16"){
+         return get_DiskIOBuildProcessor_2<int16_t>(this->disk_path, d, ntotal);
+    }else{
+        FAISS_THROW_MSG("Unsupported type");
+    }
+}
+
+DiskIOProcessor* IndexIVFPQDisk::get_DiskIOSearchProcessor() const{
+    if(this->valueType == "float"){
+        return get_DiskIOSearchProcessor_2<float>(this->disk_path, d);
+    }else if(this->valueType == "uint8"){
+        return get_DiskIOSearchProcessor_2<uint8_t>(this->disk_path, d);
+    }else if(this->valueType == "int16"){
+        return get_DiskIOSearchProcessor_2<int16_t>(this->disk_path, d);
+    }else{
+        FAISS_THROW_FMT("Unsupported type %s", this->valueType.c_str());
+
+    }
+
+}
+
 
 IndexIVFPQDiskStats indexIVFPQDisk_stats;
 

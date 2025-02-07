@@ -37,7 +37,7 @@ add_executable(demo_ivfflat_replicas EXCLUDE_FROM_ALL demo_ivfflat_replicas.cpp)
 target_link_libraries(demo_ivfflat_replicas PRIVATE faiss_avx2)
 
 add_executable(demo_ivfpq_refine EXCLUDE_FROM_ALL demo_ivfpq_refine.cpp)
-target_link_libraries(demo_ivfpq_refine PRIVATE faiss_avx2)
+target_link_libraries(demo_ivfpq_refine PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
 
 add_executable(demo_ivfpq_common EXCLUDE_FROM_ALL demo_ivfpq_common.cpp)
 target_link_libraries(demo_ivfpq_common PRIVATE faiss_avx2)
@@ -54,6 +54,14 @@ target_link_libraries(demo_ivfpqfs PRIVATE faiss_avx2)
 add_executable(demo_sep_ivfpqdisk EXCLUDE_FROM_ALL demo_sep_ivfpqdisk.cpp)
 target_link_libraries(demo_sep_ivfpqdisk PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
 
+add_executable(demo_sep_ivfpqdisk2 EXCLUDE_FROM_ALL demo_sep_ivfpqdisk2.cpp)
+target_link_libraries(demo_sep_ivfpqdisk2 PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
+
+add_executable(demo_ivf_pq_fs_disk EXCLUDE_FROM_ALL demo_ivf_pq_fs_disk.cpp)
+target_link_libraries(demo_ivf_pq_fs_disk PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
+
+add_executable(demo_sep_2 EXCLUDE_FROM_ALL demo_sep_2.cpp)
+target_link_libraries(demo_sep_2 PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
 
 add_executable(demo_refine_disk EXCLUDE_FROM_ALL demo_refine_disk.cpp)
 target_link_libraries(demo_refine_disk PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
@@ -61,11 +69,18 @@ target_link_libraries(demo_refine_disk PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
 add_executable(demo_sep_refine_disk EXCLUDE_FROM_ALL demo_sep_refine_disk.cpp)
 target_link_libraries(demo_sep_refine_disk PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
 
-add_executable(demo_sep_ivfpqdisk_sift1m EXCLUDE_FROM_ALL demo_sep_ivfpqdisk_sift1m.cpp)
-target_link_libraries(demo_sep_ivfpqdisk_sift1m PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
-# add_executable(demo_sep_ivfpqfsdisk EXCLUDE_FROM_ALL demo_sep_ivfpqfsdisk.cpp)
-# target_link_libraries(demo_sep_ivfpqfsdisk PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
+add_executable(demo_sep_ivfpqfsdisk EXCLUDE_FROM_ALL demo_sep_ivfpqfsdisk.cpp)
+target_link_libraries(demo_sep_ivfpqfsdisk PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
 
-add_executable(demo_sep_ivfpqfsdiskk EXCLUDE_FROM_ALL demo_sep_ivfpqfsdiskk.cpp)
-target_link_libraries(demo_sep_ivfpqfsdiskk PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
+add_executable(demo_ivfpq_10m EXCLUDE_FROM_ALL demo_ivfpq_10m.cpp)
+target_link_libraries(demo_ivfpq_10m PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
+
+add_executable(demo_sep_ivfpqdisk10m EXCLUDE_FROM_ALL demo_sep_ivfpqdisk10m.cpp)
+target_link_libraries(demo_sep_ivfpqdisk10m PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
+
+add_executable(demo_sep_ivfpqdisk10m_beam_search EXCLUDE_FROM_ALL demo_sep_ivfpqdisk10m_beam_search.cpp)
+target_link_libraries(demo_sep_ivfpqdisk10m_beam_search PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
+
+add_executable(demo_sep_ivfpqdisk2_beam_search EXCLUDE_FROM_ALL demo_sep_ivfpqdisk2_beam_search.cpp)
+target_link_libraries(demo_sep_ivfpqdisk2_beam_search PRIVATE faiss_avx2 OpenMP::OpenMP_CXX)
 

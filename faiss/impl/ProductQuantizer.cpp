@@ -288,7 +288,6 @@ void ProductQuantizer::compute_code(const float* x, uint8_t* code) const {
 
 template <class PQDecoder>
 void decode(const ProductQuantizer& pq, const uint8_t* code, float* x) {
-    printf("decode1\n");
     PQDecoder decoder(code, pq.nbits);
     for (size_t m = 0; m < pq.M; m++) {
         uint64_t c = decoder.decode();
@@ -301,24 +300,20 @@ void decode(const ProductQuantizer& pq, const uint8_t* code, float* x) {
 void ProductQuantizer::decode(const uint8_t* code, float* x) const {
     switch (nbits) {
         case 8:
-            printf("test ProductQuantizer::decode1\n");
             faiss::decode<PQDecoder8>(*this, code, x);
             break;
 
         case 16:
-        printf("test ProductQuantizer::decode2\n");
             faiss::decode<PQDecoder16>(*this, code, x);
             break;
 
         default:
-        printf("test ProductQuantizer::decode3\n");
             faiss::decode<PQDecoderGeneric>(*this, code, x);
             break;
     }
 }
 
 void ProductQuantizer::decode(const uint8_t* code, float* x, size_t n) const {
-    printf("test ProductQuantizer::decode\n");
 #pragma omp parallel for if (n > 100)
     for (int64_t i = 0; i < n; i++) {
         this->decode(code + code_size * i, x + d * i);

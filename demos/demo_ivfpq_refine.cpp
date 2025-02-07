@@ -23,6 +23,8 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <omp.h>
+
 using idx_t = faiss::idx_t;
 double elapsed() {
     struct timeval tv;
@@ -63,10 +65,71 @@ float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
 int* ivecs_read(const char* fname, size_t* d_out, size_t* n_out) {
     return (int*)fvecs_read(fname, d_out, n_out);
 }
+
+float* load_and_convert_to_float(const char* fname, size_t* d_out, size_t* n_out, size_t batch_size = 1000000) {
+    FILE* f = fopen(fname, "rb");
+    if (!f) {
+        fprintf(stderr, "Could not open %s\n", fname);
+        perror("");
+        abort();
+    }
+
+    // 读取向量维度
+    int d;
+    fread(&d, sizeof(int), 1, f);
+    assert((d > 0 && d < 1000000) || !"Unreasonable dimension");
+    fseek(f, 0, SEEK_SET);
+    // 检查文件大小是否符合预期
+    struct stat st;
+    fstat(fileno(f), &st);
+    size_t sz = st.st_size;
+
+    // 每个向量包含：1个int (维度指示符) + d个uint8数据
+    size_t per_vector_size = sizeof(int) + d * sizeof(uint8_t);
+    assert(sz % per_vector_size == 0 || !"Weird file size");
+
+    size_t n = sz / per_vector_size; // 向量数量
+    *d_out = d;
+    *n_out = n;
+
+    // 分配最终存储的float数组
+    float* result = new float[n * d];
+
+    size_t vectors_left = n;
+    size_t offset = 0; // 用于在 result 中定位当前写入位置
+
+    while (vectors_left > 0) {
+        size_t current_batch_size = std::min(batch_size, vectors_left);
+
+        // 临时缓冲区：每个向量前有1个int头，后接d个uint8数据
+        std::vector<uint8_t> temp(per_vector_size * current_batch_size);
+        size_t nr = fread(temp.data(), sizeof(uint8_t), temp.size(), f);
+        std::cout << "vector size:"<<  current_batch_size <<" nr:" << nr << "  temp size:" << temp.size() << std::endl;
+        assert(nr == temp.size() || !"Could not read batch");
+
+        // 转换并存入 result
+        for (size_t i = 0; i < current_batch_size; i++) {
+            // 跳过维度指示符 (1个int)
+            const uint8_t* data_ptr = temp.data() + i * per_vector_size + sizeof(int);
+
+            // 将 uint8 转换为 float
+            for (size_t j = 0; j < d; j++) {
+                result[offset + i * d + j] = static_cast<float>(data_ptr[j]);
+            }
+        }
+
+        offset += current_batch_size * d; // 更新写入偏移
+        vectors_left -= current_batch_size;
+    }
+
+    fclose(f);
+    return result;
+}
+
 int main() {
     double t0 = elapsed();
     int d = 128;      // dimension
-    int nb = 1000000; // database size
+    int nb = 1000000*10; // database size
     int nq = 10000;   // nb of queries
     char* base_filepath ="/mnt/d/VectorDB/sift/sift/sift_base.fvecs";
     char* query_filepath ="/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
@@ -94,7 +157,7 @@ int main() {
                 trainvecs[d * i + j] = xb[rng * d + j];
             }
         }
-        int nlist = 1000;
+        int nlist = 8000;
         int k = 100;
         // load ground-truth and convert int to long
         size_t nq2;
@@ -102,10 +165,10 @@ int main() {
         int* gt_int = ivecs_read("/mnt/d/VectorDB/sift/sift/sift_groundtruth.ivecs", &kk, &nq2);
         faiss::IndexFlatL2 coarse_quantizer(d);
         //pq parameters
-        int m = 32;
-        int nbits = 4;
+        int m = 16;
+        int nbits = 8;
         faiss::IndexIVFPQ index(&coarse_quantizer, d, nlist, m, nbits);
-        index.set_assign_replicas(3);
+        index.set_assign_replicas(1);
         faiss::IndexRefineFlat newindex(&index);
         newindex.k_factor = 3;
         // faiss::IndexIVFFlat index(&quantizer, d, nlist);
@@ -148,13 +211,13 @@ int main() {
             //         printf("%5zd ", I[i * k + j]);
             //     printf("\n");
             // }
-            int arr[] = {4, 5, 6, 7, 8, 10};
+            int arr[] = {5, 10, 20};
             //int arr[] = {5, 7, 9, 11, 13};
             //int arr[] = {15,18,21,24,27};
 
             // write_index(index, "hnsw.index");
             // how to get length of array
-
+            omp_set_num_threads(1);
             for (int i : arr) {
                 // faiss::SearchParametersIVF params;
                 // print current i

@@ -77,10 +77,10 @@ void disk_build(const char* base_filepath, int nb, int d, int ratio, const std::
         }
     }
 
-    int nlist = 5000;
-    int m = 64;
+    int nlist = 2000;
+    int m = 32;
     int nbits = 4;
-// omp_set_num_threads(1);
+
     faiss::IndexFlatL2 quantizer(d);
     
     // Declare pointers to the base index and refine index
@@ -103,7 +103,7 @@ void disk_build(const char* base_filepath, int nb, int d, int ratio, const std::
         throw std::invalid_argument("Invalid type specified. Use 0 for IndexIVFPQ, 1 for IndexIVFPQFastScan.");
     }
 
-    index_refine->k_factor = 10;
+    index_refine->k_factor = 3;
 
     printf("[%.3f s] IndexIVFPQ_Refine start to train\n", elapsed() - t0);
     index_refine->train(nb / ratio, trainvecs.data());
@@ -152,7 +152,7 @@ void search(const char* query_filepath, const char* ground_truth_filepath, int n
     }
     faiss::IndexDisk* index_ds =  dynamic_cast<faiss::IndexDisk*>(index->refine_index);
     std::cout << " index_ds->disk_path :" << index_ds->disk_path << std::endl;
-    index->k_factor = 10;
+    index->k_factor = 7;
     std::vector<double> search_times;
     std::vector<double> recalls;
     omp_set_num_threads(1);
@@ -165,8 +165,8 @@ void search(const char* query_filepath, const char* ground_truth_filepath, int n
     }
     delete[] gt_int;
 
-    int arr[] = {20, 30, 60, 80, 100, 120, 150, 200};
-// int arr[] = {120};
+    int arr[] = {150};
+
     for (int i : arr) {
         printf("-----------now, the nprobe is=%d---------\n", i);
 
@@ -183,14 +183,12 @@ void search(const char* query_filepath, const char* ground_truth_filepath, int n
         printf("[%.3f s] IndexIVFPQ_disk search finished\n", elapsed() - t0);
 
         size_t re = faiss::indexDisk_stats.rerank;
-        double de = faiss::indexDisk_stats.disk_elapsed.count()/1e6; 
-        double me = faiss::indexDisk_stats.memory_elapsed.count()/1e6; 
-        faiss::indexDisk_stats.rerank=0;
-        faiss::indexDisk_stats.disk_elapsed = std::chrono::duration<double, std::micro>(0);
-        faiss::indexDisk_stats.memory_elapsed = std::chrono::duration<double, std::micro>(0);
+        double de = faiss::indexDisk_stats.disk_elapsed.count() / 1000; 
+        double me = faiss::indexDisk_stats.memory_elapsed.count() / 1000; 
+            
         std::cout << "rerank:               :"<< re/nq << std::endl;
-        std::cout << "disk_elapsed          :" << de << std::endl;
-        std::cout << "memory_elapsed        :" << me << std::endl;
+        std::cout << "disk_elapsed          :" << de/nq << std::endl;
+        std::cout << "memory_elapsed        :" << me/nq << std::endl;
 
         int repeated = 0;
         for (int i = 0; i < nq; i++)
@@ -307,16 +305,17 @@ int main(int argc, char *argv[]) {
     // Set parameters
     int d = 128;      // dimension
     int nb = 1000000; // database size
-    int nq = 10000;   // number of queries
+    int nq = 100;   // number of queries
     int ratio = 50;   // ratio for training
     int k = 100;      // number of nearest neighbors to search
-    const char* base_filepath = "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_base.fvecs";
-    const char* query_filepath = "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_query.fvecs";
-    const char* ground_truth_filepath =  "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_groundtruth.ivecs";
+
+    const char* base_filepath = "/mnt/d/VectorDB/sift/sift/sift_base.fvecs";
+    const char* query_filepath = "/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
+    const char* ground_truth_filepath = "/mnt/d/VectorDB/sift/sift/sift_groundtruth.ivecs";
 
     // Adjust index store path based on pq type
-    std::string index_write_path = "/home/zhan4404/disk-based/newfaiss_disk/faiss4_disk_vector/build/demos/index_folder/sift1m/sift1M_refine_pq32_8_nlist8000_" + pq_type_str;
-    std::string disk_data_store_path = "/home/zhan4404/disk-based/newfaiss_disk/faiss4_disk_vector/build/demos/index_folder/sift1m/sift_base.fvecs_" + pq_type_str;
+    std::string index_write_path = "/home/granthe/faiss/faiss/build/data/sift1M/sift1M_refine_pq32_8_nlist8000_" + pq_type_str;
+    std::string disk_data_store_path = "/home/granthe/data/sift1M/sift_base.fvecs_" + pq_type_str;
  
     // Perform the specified operation
     if (op_type == 0) {

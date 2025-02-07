@@ -52,7 +52,7 @@ void IndexIVFFlat::add_core(
         void* inverted_list_context) {
 
     idx_t num_centroids=assign_replicas;
-    // std::cout<<num_centroids<<std::endl;
+    std::cout<<num_centroids<<std::endl;
 
     FAISS_THROW_IF_NOT(is_trained);
     FAISS_THROW_IF_NOT(coarse_idx);

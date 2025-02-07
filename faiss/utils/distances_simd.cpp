@@ -19,6 +19,10 @@
 #include <faiss/impl/platform_macros.h>
 #include <faiss/utils/simdlib.h>
 
+#define PORTABLE_ALIGN32 __attribute__((aligned(32)))
+#define PORTABLE_ALIGN64 __attribute__((aligned(64)))
+#include <immintrin.h>
+
 #ifdef __SSE3__
 #include <immintrin.h>
 #endif
@@ -222,6 +226,63 @@ float fvec_L2sqr(const float* x, const float* y, size_t d) {
     return res;
 }
 FAISS_PRAGMA_IMPRECISE_FUNCTION_END
+
+// FAISS_PRAGMA_IMPRECISE_FUNCTION_BEGIN
+// template<typename T>
+// float vec_L2sqr(const T* x, const T* y, size_t d) {
+//     size_t i;
+//     float res = 0;
+//     FAISS_PRAGMA_IMPRECISE_LOOP
+//     for (i = 0; i < d; i++) {
+//         const float tmp = (float)x[i] - (float)y[i];
+//         res += tmp * tmp;
+//     }
+//     return res;
+// }
+// FAISS_PRAGMA_IMPRECISE_FUNCTION_END
+
+float fvec_L2sqr_simd(const float* x, const float* y, const size_t L) {
+    float PORTABLE_ALIGN32 TmpRes[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t num_blk16 = L >> 4;
+    uint32_t l = L & 0b1111;
+
+    __m256 diff, v1, v2;
+    __m256 sum = _mm256_set1_ps(0);
+    for(int i=0;i<num_blk16;i++) {
+        v1 = _mm256_loadu_ps(x);
+        v2 = _mm256_loadu_ps(y);
+        x += 8;
+        y += 8;
+        diff = _mm256_sub_ps(v1, v2);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+
+        v1 = _mm256_loadu_ps(x);
+        v2 = _mm256_loadu_ps(y);
+        x += 8;
+        y += 8;
+        diff = _mm256_sub_ps(v1, v2);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+    }
+    for(int i=0;i<l/8;i++){
+        v1 = _mm256_loadu_ps(x);
+        v2 = _mm256_loadu_ps(y);
+        x += 8;
+        y += 8;
+        diff = _mm256_sub_ps(v1, v2);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+    }
+    _mm256_store_ps(TmpRes, sum);
+
+    float ret = TmpRes[0] + TmpRes[1] + TmpRes[2] + TmpRes[3] + TmpRes[4] + TmpRes[5] + TmpRes[6] + TmpRes[7];
+    
+    for(int i=0;i<l%8;i++){
+        float tmp = (*x) - (*y);
+        ret += tmp * tmp;
+        x ++;
+        y ++;
+    }
+    return ret;
+}
 
 /// Special version of inner product that computes 4 distances
 /// between x and yi

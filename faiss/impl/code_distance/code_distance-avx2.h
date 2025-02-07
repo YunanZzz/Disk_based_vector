@@ -247,7 +247,7 @@ typename std::enable_if<!std::is_same<PQDecoderT, PQDecoder8>::value, float>::
                 const float* sim_table,
                 const uint8_t* code) {
     // default implementation
-    return distance_single_code_avx2<PQDecoderT>(M, nbits, sim_table, code);
+    return distance_single_code_generic<PQDecoderT>(M, nbits, sim_table, code);
 }
 
 template <typename PQDecoderT>
@@ -380,76 +380,6 @@ typename std::enable_if<!std::is_same<PQDecoderT, PQDecoder8>::value, void>::
             result3);
 }
 
-// static float inline optimized_horizontal_sum(__m256 v); // Forward declaration
-// static inline float optimized_horizontal_sum(__m256 v) {
-//     // Reduce the 8 values in the AVX register to a single float sum
-//     __m256 temp1 = _mm256_hadd_ps(v, v); // First horizontal addition
-//     __m256 temp2 = _mm256_hadd_ps(temp1, temp1); // Second horizontal addition
-//     return _mm_cvtss_f32(_mm256_extractf128_ps(temp2, 1)) + _mm_cvtss_f32(_mm256_extractf128_ps(temp2, 0)); // Extract and sum
-// }
-// template <typename PQDecoderT>
-// typename std::enable_if<std::is_same<PQDecoderT, PQDecoder8>::value, void>::type
-// distance_four_codes_avx2(
-//         const size_t M,
-//         const size_t nbits,
-//         const float* sim_table,
-//         const uint8_t* __restrict code0,
-//         const uint8_t* __restrict code1,
-//         const uint8_t* __restrict code2,
-//         const uint8_t* __restrict code3,
-//         float& result0,
-//         float& result1,
-//         float& result2,
-//         float& result3) {
-    
-//     result0 = result1 = result2 = result3 = 0;
-//     constexpr size_t ksub = 1 << 8;
-//     size_t m = 0;
-//     const size_t pqM16 = M / 16;
-
-//     constexpr intptr_t N = 4;
-//     const float* tab = sim_table;
-
-//     if (pqM16 > 0) {
-//         const __m256i vksub = _mm256_set1_epi32(ksub);
-//         __m256i offsets_0 = _mm256_mullo_epi32(_mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7), vksub);
-        
-//         __m256 partialSums[N] = {_mm256_setzero_ps()};
-
-//         for (m = 0; m < pqM16 * 16; m += 16) {
-//             _mm_prefetch((const char*)(tab + ksub * 8), _MM_HINT_T0); // Prefetch the next data
-
-//             __m128i mm1[N];
-//             for (int j = 0; j < N; j++) {
-//                 mm1[j] = _mm_loadu_si128((const __m128i_u*)(code0 + m + j * 4));
-//             }
-
-//             for (intptr_t j = 0; j < N; j++) {
-//                 __m256i idx1 = _mm256_cvtepu8_epi32(mm1[j]);
-//                 __m256i indices_to_read_from = _mm256_add_epi32(idx1, offsets_0);
-//                 __m256 collected = _mm256_i32gather_ps(tab, indices_to_read_from, sizeof(float));
-//                 partialSums[j] = _mm256_add_ps(partialSums[j], collected);
-//             }
-//         }
-
-//         result0 += horizontal_sum(partialSums[0]);
-//         result1 += horizontal_sum(partialSums[1]);
-//         result2 += horizontal_sum(partialSums[2]);
-//         result3 += horizontal_sum(partialSums[3]);
-//     }
-
-//     for (; m < M; m++) {
-//         PQDecoder8 decoder0(code0 + m, nbits);
-//         PQDecoder8 decoder1(code1 + m, nbits);
-//         PQDecoder8 decoder2(code2 + m, nbits);
-//         PQDecoder8 decoder3(code3 + m, nbits);
-//         result0 += tab[decoder0.decode()];
-//         result1 += tab[decoder1.decode()];
-//         result2 += tab[decoder2.decode()];
-//         result3 += tab[decoder3.decode()];
-//         tab += ksub;
-//     }
-// }
 // Combines 4 operations of distance_single_code()
 template <typename PQDecoderT>
 typename std::enable_if<std::is_same<PQDecoderT, PQDecoder8>::value, void>::type

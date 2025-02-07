@@ -30,6 +30,35 @@ float fvec_L2sqr(const float* x, const float* y, size_t d);
 /// Squared L2 distance between two vectors by simd
 float fvec_L2sqr_simd(const float* x, const float* y, size_t d);
 
+/// Squared L2 distance between two vectors in other type
+FAISS_PRAGMA_IMPRECISE_FUNCTION_BEGIN
+template<typename T>
+float vec_L2sqr(const T* x, const T* y, size_t d){
+    size_t i;
+    float res = 0;
+    FAISS_PRAGMA_IMPRECISE_LOOP
+    for (i = 0; i < d; i++) {
+        const float tmp = (float)x[i] - (float)y[i];
+        res += tmp * tmp;
+    }
+    return res;
+}
+FAISS_PRAGMA_IMPRECISE_FUNCTION_END
+
+FAISS_PRAGMA_IMPRECISE_FUNCTION_BEGIN
+template<typename T>
+float vec_L2sqr_h(const float* x, const T* y, size_t d){
+    size_t i;
+    float res = 0;
+    FAISS_PRAGMA_IMPRECISE_LOOP
+    for (i = 0; i < d; i++) {
+        const float tmp = x[i] - (float)y[i];
+        res += tmp * tmp;
+    }
+    return res;
+}
+FAISS_PRAGMA_IMPRECISE_FUNCTION_END
+
 /// inner product
 float fvec_inner_product(const float* x, const float* y, size_t d);
 

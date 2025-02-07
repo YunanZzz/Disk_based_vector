@@ -34,6 +34,14 @@ idx_t InvertedLists::get_single_id(size_t list_no, size_t offset) const {
     return id;
 }
 
+const size_t* InvertedLists::get_inlist_map(size_t list_no) const{}
+
+void InvertedLists::updata_inlist_map(size_t list_no, size_t o, size_t n){};
+
+void InvertedLists::update_inlist_map_size(size_t list_no, size_t s){};
+
+void InvertedLists::add_maps(size_t list_no, size_t new_size){};
+
 void InvertedLists::release_codes(size_t, const uint8_t*) const {}
 
 void InvertedLists::release_ids(size_t, const idx_t*) const {}
@@ -344,6 +352,61 @@ void ArrayInvertedLists::permute_invlists(const idx_t* map) {
 }
 
 ArrayInvertedLists::~ArrayInvertedLists() {}
+
+/*****************************************************************
+ * In-list clustered list implementations
+ *****************************************************************/
+
+ClusteredArrayInvertedLists::ClusteredArrayInvertedLists(size_t nlist, size_t code_size):ArrayInvertedLists(nlist, code_size){
+    inlist_maps.resize(nlist);
+}   
+
+const size_t* ClusteredArrayInvertedLists::get_inlist_map(size_t list_no) const {
+    assert(list_no < nlist);
+    return inlist_maps[list_no].data();
+}
+
+void ClusteredArrayInvertedLists::updata_inlist_map(size_t list_no, size_t o, size_t n){
+    assert(list_no < nlist);
+    assert(o < ids[list_no].size() && n < ids[list_no].size());
+    inlist_maps[list_no][o] = n;
+}
+
+void ClusteredArrayInvertedLists::update_inlist_map_size(size_t list_no, size_t s){
+    assert(list_no < nlist);
+    inlist_maps[list_no].resize(s);
+}
+
+void ClusteredArrayInvertedLists::resize(size_t list_no, size_t new_size){
+    //ids[list_no].resize(new_size);
+    //codes[list_no].resize(new_size * code_size);
+    inlist_maps[list_no].resize(new_size);
+}
+
+void ClusteredArrayInvertedLists::add_maps(size_t list_no, size_t new_size){
+    //ids[list_no].resize(new_size);
+    //codes[list_no].resize(new_size * code_size);
+    inlist_maps[list_no].resize(new_size);
+}
+
+void ClusteredArrayInvertedLists::permute_invlists(const idx_t* map){
+    std::vector<std::vector<uint8_t>> new_codes(nlist);
+    std::vector<std::vector<idx_t>> new_ids(nlist);
+    std::vector<std::vector<size_t>> new_inlist_maps(nlist);  
+
+    for (size_t i = 0; i < nlist; i++) {
+        size_t o = map[i];
+        FAISS_THROW_IF_NOT(o < nlist);
+
+        std::swap(new_inlist_maps[i], inlist_maps[o]);
+        std::swap(new_codes[i], codes[o]);
+        std::swap(new_ids[i], ids[o]);
+    }
+    std::swap(inlist_maps, new_inlist_maps);
+    std::swap(codes, new_codes);
+    std::swap(ids, new_ids);
+}
+
 
 /*****************************************************************
  * Meta-inverted list implementations

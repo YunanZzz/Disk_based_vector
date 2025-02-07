@@ -14,6 +14,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+
 #include <faiss/Clustering.h>
 #include <faiss/Index.h>
 #include <faiss/impl/IDSelector.h>
@@ -21,7 +22,6 @@
 #include <faiss/invlists/DirectMap.h>
 #include <faiss/invlists/InvertedLists.h>
 #include <faiss/utils/Heap.h>
-
 
 namespace faiss {
 
@@ -204,13 +204,11 @@ struct IndexIVF : Index, IndexIVFInterface {
     /// centroids?
     bool by_residual = true;
     int assign_replicas = 1;
-    std::string centroid_index_path = "centroid_index";
-//     faiss::IndexHNSWFlat* centroid_index = nullptr;
+
     /** The Inverted file takes a quantizer (an Index) on input,
      * which implements the function mapping a vector to a list
      * identifier.
      */
-
     IndexIVF(
             Index* quantizer,
             size_t d,
@@ -223,10 +221,10 @@ struct IndexIVF : Index, IndexIVFInterface {
         this->assign_replicas = k;
     }
 
-    void set_centroid_index_path(const std::string& centroid_path) {
-        centroid_index_path = centroid_path;
-    }
     void reset() override;
+
+    /// Sometime we need a extra graph index when building disk index
+    virtual void train_graph();
 
     /// Trains the quantizer and calls train_encoder to train sub-quantizers
     void train(idx_t n, const float* x) override;
@@ -424,7 +422,7 @@ struct IndexIVF : Index, IndexIVFInterface {
             idx_t a1,
             idx_t a2) const;
 
-    ~IndexIVF();
+    ~IndexIVF() override;
 
     size_t get_list_size(size_t list_no) const {
         return invlists->list_size(list_no);
@@ -545,6 +543,8 @@ struct InvertedListScanner {
             float radius,
             RangeQueryResult& result,
             size_t& list_size) const;
+
+    virtual void async_submit(int num = -1);
 
     virtual ~InvertedListScanner() {}
 };

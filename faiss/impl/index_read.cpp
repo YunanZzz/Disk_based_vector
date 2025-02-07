@@ -35,6 +35,7 @@
 #include <faiss/IndexIVFIndependentQuantizer.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFPQDisk.h>
+#include <faiss/IndexIVFPQDisk2.h>
 #include <faiss/IndexIVFPQFastScan.h>
 #include <faiss/IndexIVFPQFastScanDisk.h>
 #include <faiss/IndexIVFPQR.h>
@@ -216,7 +217,40 @@ InvertedLists* read_InvertedLists(IOReader* f, int io_flags) {
         }
         return ails;
 
-    } else if (h == fourcc("ilar") && (io_flags & IO_FLAG_SKIP_IVF_DATA)) {
+    } else if (h == fourcc("clic") && !(io_flags & IO_FLAG_SKIP_IVF_DATA)) {
+        // New logic for ClusteredArrayInvertedLists
+        auto cails = new ClusteredArrayInvertedLists(0, 0);
+        READ1(cails->nlist);
+        READ1(cails->code_size);
+        cails->ids.resize(cails->nlist);
+        cails->codes.resize(cails->nlist);
+        cails->inlist_maps.resize(cails->nlist);
+
+        std::vector<size_t> sizes(cails->nlist);
+        read_ArrayInvertedLists_sizes(f, sizes);
+
+        for (size_t i = 0; i < cails->nlist; i++) {
+            cails->ids[i].resize(sizes[i]);
+            cails->codes[i].resize(sizes[i] * cails->code_size);
+            cails->inlist_maps[i].resize(sizes[i]); // Resize map for each list
+        }
+        std::cout << "code_size:" << cails->code_size << std::endl;
+        size_t total_size = 0;
+        for (size_t i = 0; i < cails->nlist; i++) {
+            size_t n = cails->ids[i].size();
+            if (n > 0) {
+                READANDCHECK(cails->codes[i].data(), n * cails->code_size);
+                READANDCHECK(cails->ids[i].data(), n);
+                READANDCHECK(cails->inlist_maps[i].data(), n); // Read inlist_map
+
+                total_size+= n*cails->code_size + n*sizeof(faiss::idx_t) + n*sizeof(size_t);
+            }
+        }
+        std::cout << "total_size:" << total_size << std::endl;
+
+        return cails;
+
+    }else if (h == fourcc("ilar") && (io_flags & IO_FLAG_SKIP_IVF_DATA)) {
         // code is always ilxx where xx is specific to the type of invlists we
         // want so we get the 16 high bits from the io_flag and the 16 low bits
         // as "il"
@@ -495,35 +529,45 @@ static IndexIVFPQ* read_ivfpq(IOReader* f, uint32_t h, int io_flags) {
     IndexIVFPQDisk* ivfpqd =
             h == fourcc("IwQD") ? new IndexIVFPQDisk() : nullptr;
 
-    IndexIVFPQ* ivpq = ivfpqr ? ivfpqr : (ivfpqd ? ivfpqd : new IndexIVFPQ());
+    IndexIVFPQDisk2* ivfpqd2 =
+            h == fourcc("IQD2") ? new IndexIVFPQDisk2() : nullptr;
+
+    IndexIVFPQ* ivpq = ivfpqr ? ivfpqr : (ivfpqd ? ivfpqd : (ivfpqd2 ? ivfpqd2 : new IndexIVFPQ()));
+
+    
 
     std::vector<std::vector<idx_t>> ids;
     read_ivf_header(ivpq, f, legacy ? &ids : nullptr);
     READ1(ivpq->by_residual);
     READ1(ivpq->code_size);
     read_ProductQuantizer(&ivpq->pq, f);
-
     if (legacy) {
         ArrayInvertedLists* ail = set_array_invlist(ivpq, ids);
         for (size_t i = 0; i < ail->nlist; i++)
             READVECTOR(ail->codes[i]);
-    } else {
-        read_InvertedLists(ivpq, f, io_flags);
-    }
-
+    } 
+    //return nullptr;
+    
     if (ivpq->is_trained) {
         ivpq->use_precomputed_table = 0;
         if (ivpq->by_residual) {
             if ((io_flags & IO_FLAG_SKIP_PRECOMPUTE_TABLE) == 0) {
-                ivpq->precompute_table();
+                //ivpq->precompute_table();   //
             }
         }
+        
         if (ivfpqr) {
+            if(!legacy){  
+                read_InvertedLists(ivpq, f, io_flags);
+            }
             read_ProductQuantizer(&ivfpqr->refine_pq, f);
             READVECTOR(ivfpqr->refine_codes);
             READ1(ivfpqr->k_factor);
         } else if (ivfpqd) {
             // Read IVFPQDisk specific members
+            if(!legacy){  
+                read_InvertedLists(ivpq, f, io_flags);
+            }
             size_t nlist = ivfpqd->nlist;
 
             // Read clusters array
@@ -550,6 +594,104 @@ static IndexIVFPQ* read_ivfpq(IOReader* f, uint32_t h, int io_flags) {
             READ1(path_length); // Read path length
             ivfpqd->disk_path.resize(path_length);
             READANDCHECK((char*)ivfpqd->disk_path.data(), path_length);
+
+            // read aligned_cluster_info array
+            
+            ivfpqd->aligned_cluster_info = new Aligned_Cluster_Info[nlist]; // 根据 nlist 动态分配数组
+            for (size_t i = 0; i < nlist; ++i) {
+                READ1(ivfpqd->aligned_cluster_info[i].page_start);
+                READ1(ivfpqd->aligned_cluster_info[i].padding_offset);
+                READ1(ivfpqd->aligned_cluster_info[i].page_count);
+            }
+
+            size_t value_type_length;
+            READ1(value_type_length);
+            ivfpqd->valueType.resize(value_type_length);
+            READANDCHECK(&ivfpqd->valueType[0], value_type_length);
+            
+        } else if (ivfpqd2) {
+            // Read IVFPQDisk2 specific members
+            // TODO read ivfpqd2->select_lists
+            READ1(ivfpqd2->select_lists);
+            if(ivfpqd2->select_lists){
+                auto cails = new ClusteredArrayInvertedLists(0, 0);
+                READ1(cails->nlist);
+                READ1(cails->code_size);
+                // adjust the detail of invlist
+                {
+                    cails->ids.resize(cails->nlist);
+                    cails->codes.resize(cails->nlist);
+                    cails->inlist_maps.resize(cails->nlist);
+                    if (cails) {
+                        FAISS_THROW_IF_NOT(cails->nlist == ivfpqd2->nlist);
+                        FAISS_THROW_IF_NOT(
+                                cails->code_size == InvertedLists::INVALID_CODE_SIZE ||
+                                cails->code_size == ivfpqd2->code_size);
+                    }
+                    ivfpqd2->invlists = cails;
+                    ivfpqd2->own_invlists = true;
+                }
+                
+                size_t select_path_length;
+                READ1(select_path_length); // Read path length
+                ivfpqd2->select_lists_path.resize(select_path_length);
+                READANDCHECK((char*)ivfpqd2->select_lists_path.data(), select_path_length);
+
+                ivfpqd2->aligned_inv_info = new Aligned_Invlist_Info[cails->nlist];
+                for (size_t i = 0; i < cails->nlist; ++i) {
+                    READ1(ivfpqd2->aligned_inv_info[i].page_start);
+                    READ1(ivfpqd2->aligned_inv_info[i].padding_offset);
+                    READ1(ivfpqd2->aligned_inv_info[i].page_count);
+                    READ1(ivfpqd2->aligned_inv_info[i].list_size);
+                }
+
+            }
+
+            if(!legacy && !ivfpqd2->select_lists){  
+                read_InvertedLists(ivpq, f, io_flags);
+            }
+
+            size_t nlist = ivfpqd2->nlist;
+
+            // Read clusters array
+            ivfpqd2->clusters = new size_t[nlist];
+            for (size_t i = 0; i < nlist; ++i) {
+                READ1(ivfpqd2->clusters[i]);
+            }
+
+            // Read len array
+            ivfpqd2->len = new size_t[nlist];
+            for (size_t i = 0; i < nlist; ++i) {
+                READ1(ivfpqd2->len[i]);
+            }
+
+            // Read other members
+            READ1(ivfpqd2->top);
+            READ1(ivfpqd2->estimate_factor);
+            READ1(ivfpqd2->estimate_factor_partial);
+            READ1(ivfpqd2->prune_factor);
+            READ1(ivfpqd2->disk_vector_offset);
+
+            // Read disk_path string
+            size_t path_length;
+            READ1(path_length); // Read path length
+            ivfpqd2->disk_path.resize(path_length);
+            READANDCHECK((char*)ivfpqd2->disk_path.data(), path_length);
+
+            // read aligned_cluster_info array
+            
+            ivfpqd2->aligned_cluster_info = new Aligned_Cluster_Info[nlist]; // 根据 nlist 动态分配数组
+            for (size_t i = 0; i < nlist; ++i) {
+                READ1(ivfpqd2->aligned_cluster_info[i].page_start);
+                READ1(ivfpqd2->aligned_cluster_info[i].padding_offset);
+                READ1(ivfpqd2->aligned_cluster_info[i].page_count);
+            }
+
+            size_t value_type_length;
+            READ1(value_type_length);
+            ivfpqd2->valueType.resize(value_type_length);
+            READANDCHECK(&ivfpqd2->valueType[0], value_type_length);
+            
         }
     }
 
@@ -914,7 +1056,7 @@ Index* read_index(IOReader* f, int io_flags) {
         idx = ivsp;
     } else if (
             h == fourcc("IvPQ") || h == fourcc("IvQR") || h == fourcc("IwPQ") ||
-            h == fourcc("IwQR") || h == fourcc("IwQD")) {
+            h == fourcc("IwQR") || h == fourcc("IwQD") || h == fourcc("IQD2")) {
         idx = read_ivfpq(f, h, io_flags);
     } else if (h == fourcc("IwIQ")) {
         auto* indep = new IndexIVFIndependentQuantizer();

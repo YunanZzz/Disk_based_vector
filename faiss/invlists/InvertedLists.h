@@ -69,6 +69,12 @@ struct InvertedLists {
      */
     virtual const idx_t* get_ids(size_t list_no) const = 0;
 
+    /// Cluster data in a list, record clustered positions
+    virtual const size_t* get_inlist_map(size_t list_no) const; 
+    virtual void updata_inlist_map(size_t list_no, size_t o, size_t n);
+    virtual void update_inlist_map_size(size_t list_no, size_t s);
+    virtual void add_maps(size_t list_no, size_t new_size);
+
     /// release codes returned by get_codes (default implementation is nop
     virtual void release_codes(size_t list_no, const uint8_t* codes) const;
 
@@ -273,6 +279,30 @@ struct ArrayInvertedLists : InvertedLists {
 
     ~ArrayInvertedLists() override;
 };
+
+/* In-list clustered array list. Disk based IVF index will use this one*/
+
+struct ClusteredArrayInvertedLists : ArrayInvertedLists{
+    // if entry[ii] is moved to entry[jj],  then inlist_map[ii] = jj, it helps not to move PQed codes and IDs
+    std::vector<std::vector<size_t>> inlist_maps;   
+
+    ClusteredArrayInvertedLists(size_t nlist, size_t code_size);
+
+    const size_t* get_inlist_map(size_t list_no) const override;
+
+    void updata_inlist_map(size_t list_no, size_t o, size_t n) override;
+
+    void update_inlist_map_size(size_t list_no, size_t s) override;
+
+    void resize(size_t list_no, size_t new_size) override;
+
+    void add_maps(size_t list_no, size_t new_size) override;
+
+    void permute_invlists(const idx_t* map);
+
+};
+
+
 
 /*****************************************************************
  * Meta-inverted lists

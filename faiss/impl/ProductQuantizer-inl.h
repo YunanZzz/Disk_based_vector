@@ -70,7 +70,6 @@ inline PQDecoderGeneric::PQDecoderGeneric(const uint8_t* code, int nbits)
 }
 
 inline uint64_t PQDecoderGeneric::decode() {
-    printf("PQDecoderGeneric::decode()\n");
     if (offset == 0) {
         reg = *code;
     }

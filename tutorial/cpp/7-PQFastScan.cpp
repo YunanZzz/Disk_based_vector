@@ -22,6 +22,7 @@
 #include <map>
 #include <random>
 #include <omp.h>
+
 using idx_t = faiss::idx_t;
 double elapsed() {
     struct timeval tv;
@@ -67,10 +68,9 @@ int main() {
     int d = 128;      // dimension
     int nb = 1000000; // database size
     int nq = 10000;   // nb of queries
-    char* base_filepath =
-            "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_base.fvecs";
-    char* query_filepath =
-            "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_query.fvecs";
+    char* base_filepath = "/mnt/d/VectorDB/sift/sift/sift_base.fvecs";
+    char* query_filepath = "/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
+    char* groundtruth_filepath = "/mnt/d/VectorDB/sift/sift/sift_groundtruth.ivecs";
     size_t dd; // dimension
     size_t nt; // the number of vectors
     float* xb = new float[d * nb];
@@ -83,8 +83,8 @@ int main() {
 
     {
         srand((int)time(0));
-        std::vector<float> trainvecs(nb / 50 * d);
-        for (int i = 0; i < nb / 50; i++) {
+        std::vector<float> trainvecs(nb / 100 * d);
+        for (int i = 0; i < nb / 100; i++) {
             int rng = (rand() % (nb + 1));
             ; // rng=random number in nb
 
@@ -100,7 +100,7 @@ int main() {
         size_t nq2;
         size_t kk;
         int* gt_int = ivecs_read(
-                "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_groundtruth.ivecs",
+                groundtruth_filepath,
                 &kk,
                 &nq2);
         faiss::IndexFlatL2 coarse_quantizer(d);
@@ -109,11 +109,11 @@ int main() {
         // index= faiss::index_factory(128, "IVF1024,PQ64x4fs");
         // faiss::IndexPQFastScan index(d,64,4,faiss::METRIC_L2);
         faiss::IndexIVFPQFastScan index(
-                &coarse_quantizer, 128, 5000, 64, 4, faiss::METRIC_L2);
-        index.set_assign_replicas(1);
+                &coarse_quantizer, 128, 1000, 64, 4, faiss::METRIC_L2);
+        index.set_assign_replicas(2);
         index.by_residual=false;
         faiss::IndexRefineFlat newindex(&index);
-        newindex.k_factor = 10;
+        newindex.k_factor = 3;
         
         // faiss::Index * index1 = faiss::read_index("large.index");
 
@@ -121,7 +121,7 @@ int main() {
         //  faiss::ParameterSpace params;
         //  params.initialize(index);
         printf("[%.3f s] IndexIVFPQFastScan start to train\n", elapsed() - t0);
-        newindex.train(nb / 50, trainvecs.data());
+        newindex.train(nb / 100, trainvecs.data());
         printf("[%.3f s] IndexIVFPQFastScan train finished\n", elapsed() - t0);
         // assert(index.is_trained);
         printf("[%.3f s] IndexIVFPQFastScan start to add\n", elapsed() - t0);
@@ -129,6 +129,7 @@ int main() {
         printf("[%.3f s] IndexIVFPQFastScan add finished\n", elapsed() - t0);
         std::vector<double> search_times;
         std::vector<double> recalls;
+        omp_set_num_threads(1);
         { // search xq
 
             idx_t* I = new idx_t[k * nq];
@@ -145,8 +146,8 @@ int main() {
             //         printf("%5zd ", I[i * k + j]);
             //     printf("\n");
             // }
-            int arr[] = {5, 7, 10, 20, 30, 40, 80, 120};
-            omp_set_num_threads(1);
+            int arr[] = {5, 7, 10, 20, 30, 40};
+
             // write_index(index, "hnsw.index");
             // how to get length of array
 
@@ -202,6 +203,15 @@ int main() {
         for (size_t i = 0; i < search_times.size(); i++) {
             std::cout << search_times[i];
             if (i < search_times.size() - 1) {
+                std::cout << ", ";
+            }
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "QPS: [";
+        for (size_t i = 0; i < recalls.size(); i++) {
+            std::cout << 1000.0/search_times[i];
+            if (i < recalls.size() - 1) {
                 std::cout << ", ";
             }
         }

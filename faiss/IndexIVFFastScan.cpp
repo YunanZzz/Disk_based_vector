@@ -96,7 +96,7 @@ void IndexIVFFastScan::add_with_ids(
     FAISS_THROW_IF_NOT(is_trained);
 
     idx_t num_centroids = assign_replicas;
-    printf("IndexIVFFastScan::num_centroids=%d\n",num_centroids);
+
     constexpr idx_t bs = 65536;
     if (n > bs) {
         double t0 = getmillisecs();

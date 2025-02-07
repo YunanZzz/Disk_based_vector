@@ -28,11 +28,6 @@
 #include <faiss/impl/CodePacker.h>
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/impl/IDSelector.h>
-#include <faiss/IndexHNSW.h>
-#include <faiss/index_io.h>
-#include <iostream>
-#include <faiss/IndexIVFPQDisk.h>
-#include <faiss/IndexIVFPQFastScanDisk.h>
 
 namespace faiss {
 
@@ -187,7 +182,6 @@ void IndexIVF::add(idx_t n, const float* x) {
 void IndexIVF::add_with_ids(idx_t n, const float* x, const idx_t* xids) {
     idx_t k = this->assign_replicas;
     std::unique_ptr<idx_t[]> coarse_idx(new idx_t[n * k]);
-    printf("IndexIVF::add_with_ids::k=%ld\n",k);
     quantizer->assign(n, x, coarse_idx.get(), k);
     add_core(n, x, xids, coarse_idx.get());
 }
@@ -1143,17 +1137,21 @@ void IndexIVF::update_vectors(int n, const idx_t* new_ids, const float* x) {
             invlists, n, new_ids, assign.data(), flat_codes.data());
 }
 
+void IndexIVF::train_graph(){
+
+}
+
 void IndexIVF::train(idx_t n, const float* x) {
-    // printf("Enter train \n");
     if (verbose) {
         printf("Training level-1 quantizer\n");
     }
 
     train_q1(n, x, verbose, metric_type);
-    
+
     if (verbose) {
         printf("Training IVF residual\n");
     }
+
     // optional subsampling
     idx_t max_nt = train_encoder_num_vectors();
     if (max_nt <= 0) {
@@ -1174,19 +1172,8 @@ void IndexIVF::train(idx_t n, const float* x) {
     } else {
         train_encoder(n, tv.x, nullptr);
     }
-    if (dynamic_cast<const faiss::IndexIVFPQDisk*>(this) || dynamic_cast<const faiss::IndexIVFPQFastScanDisk*>(this) ){
-        std::cout << "The index is of type Disk.\n";
-            IndexFlat* flat_quantizer = dynamic_cast<IndexFlat*>(quantizer);
-    if (flat_quantizer != nullptr) {
-            faiss::IndexHNSWFlat index(d, 16);
-            index.add(quantizer->ntotal, flat_quantizer->get_xb()); 
-            faiss::write_index(&index, this->centroid_index_path.c_str());
-             std::cout << "Output centroid index.\n";
-             } else {
-        // Handle the case where quantizer is not of type IndexFlat
-        std::cerr << "Quantizer is not an IndexFlat." << std::endl;
-        }
-    }
+    train_graph(); //  This function will be override only in disk index.
+
     is_trained = true;
 }
 
@@ -1401,6 +1388,10 @@ void InvertedListScanner::iterate_codes_range(
         }
         list_size++;
     }
+}
+
+void InvertedListScanner::async_submit(int num){
+    FAISS_THROW_MSG("Only Support Disk Index!");
 }
 
 } // namespace faiss

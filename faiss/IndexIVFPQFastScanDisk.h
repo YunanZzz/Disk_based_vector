@@ -50,6 +50,8 @@ struct IndexIVFPQFastScanDisk : public IndexIVFPQFastScan {
 
     ~IndexIVFPQFastScanDisk();
 
+    void add(idx_t n, const float* x) override;
+
     /*------------------------override from IVFPQFastScan--------------------*/
     void search_dispatch_implem(
             idx_t n,
@@ -81,11 +83,10 @@ struct IndexIVFPQFastScanDisk : public IndexIVFPQFastScan {
     void set_disk_write(const std::string& diskPath); // Method to set the disk path and
                                           // open write stream
 
-    void initial_location(float* data); // Method to initialize the location arrays.  Maybe
-                                         // can put it in some other functions. But I'd
-                                        // prefer to explicitly calling it now. Must call it
-                                        // before search.
-    void reorganize_vectors(float* data);
+    void initial_location(idx_t n, const float* data); // Method to initialize the location arrays.  Maybe
+                             // can put it in some other functions. But I'd
+                             // prefer to explicitly calling it now. Must call it before search.
+    void reorganize_vectors(idx_t n, const float* data, size_t* old_clusters,size_t* old_len);
 
     void load_from_offset(
             size_t list_no,

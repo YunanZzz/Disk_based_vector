@@ -8,9 +8,11 @@
 #include <faiss/AutoTune.h>
 #include <faiss/Index.h>
 #include <faiss/IndexFlat.h>
+#include <faiss/IndexHNSW.h>
 #include <faiss/IndexIVF.h>
 #include <faiss/IndexIVFFlat.h>
 #include <faiss/IndexIVFPQDisk.h>
+
 
 #include <faiss/index_io.h>
 #include <sys/stat.h>
@@ -71,7 +73,7 @@ int main() {
     char* query_filepath ="/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
     char* ground_truth_filepath="/mnt/d/VectorDB/sift/sift/sift_groundtruth.ivecs";
     
-    std::string index_store_path  = "/mnt/d/VectorDB/sift/sift1m_test/sift1M";
+    std::string index_store_path  = "/home/granthe/faiss/faiss/build/sift1M";
     //std::string result_path       = "/mnt/d/VectorDB/RESULT_SET/ivf_pq_disk_wsl.txt";
 
     size_t dd; // dimension
@@ -98,7 +100,7 @@ int main() {
                 trainvecs[d * i + j] = xb[rng * d + j];
             }
         }
-        int nlist = 1000;
+        int nlist = 8000;
         int k = 100;
         // load ground-truth and convert int to long
         size_t nq2;
@@ -111,11 +113,14 @@ int main() {
         // Disk parameters
         int top_clusters = 5;
         float estimate_factor = 1.2;
-        float prune_factor = 1.9;
+        float estimate_factor_partial =1.3;
+        float prune_factor = 10;
 
-        faiss::IndexFlatL2 quantizer(d);
+        int M = 32;
+        faiss::IndexHNSWFlat quantizer(d, M);
         faiss::IndexIVFPQDisk index(&quantizer, d, nlist, m, nbits, top_clusters, estimate_factor, prune_factor,index_store_path);   
-        index.set_assign_replicas(3);
+        index.set_estimate_factor_partial(estimate_factor_partial);
+        index.set_assign_replicas(2);
         index.verbose = true;
 
         printf("[%.3f s] IndexIVFPQ_disk start to train\n", elapsed() - t0);
@@ -123,16 +128,19 @@ int main() {
         printf("[%.3f s] IndexIVFPQ_disk train finished\n", elapsed() - t0);
 
         printf("[%.3f s] IndexIVFPQ_disk start to add\n", elapsed() - t0);
-        index.add(nb, xb);
+        int nadd = 10;
+        for(int i = 0; i < nadd; i++){
+            index.add(nb/nadd, xb + nb/nadd * i * d);
+        }
         printf("[%.3f s] IndexIVFPQ_disk add finished\n", elapsed() - t0);
 
         printf("[%.3f s] IndexIVFPQ_disk start to reorg\n", elapsed() - t0);
-        index.initial_location(xb);
+        //index.initial_location(xb);
         printf("[%.3f s] IndexIVFPQ_disk reorg finished\n", elapsed() - t0);
 
         std::vector<double> search_times;
         std::vector<double> recalls;
-        omp_set_num_threads(1);
+        //omp_set_num_threads(1);
         { // search xq
 
             idx_t* I = new idx_t[k * nq];
@@ -145,7 +153,9 @@ int main() {
             delete[] gt_int;
             //int arr[] = {4, 5, 6, 7, 8, 10};
             //int arr[] = {5, 7, 9, 11, 13};
-            int arr[] = {5,10,15,20,25,27};
+            //int arr[] = {5,10,15,20,25,30};
+            int arr[] = {50,60,70,80,90,100};
+            //int arr[] = { 90,100,120, 140};
 
             // write_index(index, "hnsw.index");
             // how to get length of array
@@ -167,6 +177,13 @@ int main() {
                 size_t pcr = faiss::indexIVFPQDisk_stats.partial_cluster_rerank;
 
                 size_t sl  = faiss::indexIVFPQDisk_stats.pruned;
+
+                double me1 = faiss::indexIVFPQDisk_stats.memory_1_elapsed.count() / 1000; 
+                double me2 = faiss::indexIVFPQDisk_stats.memory_2_elapsed.count() / 1000; 
+                double dfe = faiss::indexIVFPQDisk_stats.disk_full_elapsed.count() / 1000; 
+                double dpe = faiss::indexIVFPQDisk_stats.disk_partial_elapsed.count() / 1000; 
+
+                
 
                 int repeated = 0;
                 for (int i = 0; i < nq; i++)
@@ -190,10 +207,10 @@ int main() {
                 std::cout << "repeated = " << repeated << std::endl;
 
 
-                std::cout << "full_cluster_compare      :"<<fcc << std::endl;
-                std::cout << "full_cluster_rerank       :"<<fcr << std::endl;
-                std::cout << "partial_cluster_compare   :"<<pcc << std::endl;
-                std::cout << "partial_cluster_rerank    :"<<pcr << std::endl;
+                std::cout << "full_cluster_compare      :"<<fcc/nq << std::endl;
+                std::cout << "full_cluster_rerank       :"<<fcr/nq << std::endl;
+                std::cout << "partial_cluster_compare   :"<<pcc/nq << std::endl;
+                std::cout << "partial_cluster_rerank    :"<<pcr/nq << std::endl;
 
                 std::cout << "AVG rerank ratio(full)    :" << (double)fcr/(double)fcc << std::endl;
                 std::cout << "AVG rerank ratio(partital):" << (double)pcr/(double)pcc << std::endl;
@@ -201,6 +218,13 @@ int main() {
                 std::cout << "Scanned lists total       :" << sl << std::endl;
                 std::cout << "Scanned lists per query   :" << (double)sl/(double)nq << std::endl;
                 std::cout << "Scanned lists account for :" << (double)sl /((double)nq*i) << std::endl;
+
+                std::cout << "memory_1_elapsed        :" << me1/nq << std::endl;
+                std::cout << "memory_2_elapsed        :" << me2/nq << std::endl;
+                std::cout << "disk_full_elapsed       :" << dfe/nq << std::endl;
+                std::cout << "disk_partial_elapsed    :" << dpe/nq << std::endl
+                          << std::endl
+                          << std::endl;
                 
 
                 faiss::indexIVFPQDisk_stats.reset();
@@ -209,7 +233,7 @@ int main() {
                 for (int i = 0; i < nq; i++) {
                     std::map<float, int> umap;
                     for (int j = 0; j < k; j++) {
-                        umap.insert({gt[i * k + j], 0});
+                        umap.insert({gt[i * 100 + j], 0});
                     }
                     for (int l = 0; l < k; l++) {
                         if (umap.find(I[i * k + l]) != umap.end()) {

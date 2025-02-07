@@ -66,7 +66,7 @@ int* ivecs_read(const char* fname, size_t* d_out, size_t* n_out) {
 int main() {
     double t0 = elapsed();
     int d = 128;      // dimension
-    int nb = 100000; // database size
+    int nb = 1000000; // database size
     int nq = 10000;   // nb of queries
     char* base_filepath ="/mnt/d/VectorDB/sift/sift/sift_base.fvecs";
     char* query_filepath ="/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
@@ -107,7 +107,7 @@ int main() {
         //int* gt_int = ivecs_read("/mnt/d/VectorDB/WEAVESS_data/siftsmall/siftsmall_groundtruth.ivecs", &kk, &nq2);
         faiss::IndexFlatL2 coarse_quantizer(d);
         //pq parameters
-        int m = 64;
+        int m = 32;
         int nbits = 4;
         faiss::IndexIVFPQ index(&coarse_quantizer, d, nlist, m, nbits);
         index.set_assign_replicas(2);

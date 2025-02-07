@@ -36,6 +36,7 @@
 #include <faiss/IndexIVFIndependentQuantizer.h>
 #include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFPQDisk.h>
+#include <faiss/IndexIVFPQDisk2.h>
 #include <faiss/IndexIVFPQFastScan.h>
 #include <faiss/IndexIVFPQFastScanDisk.h>
 #include <faiss/IndexIVFPQR.h>
@@ -251,7 +252,52 @@ void write_InvertedLists(const InvertedLists* ils, IOWriter* f) {
     if (ils == nullptr) {
         uint32_t h = fourcc("il00");
         WRITE1(h);
-    } else if (
+    } else if (const auto& cails = dynamic_cast<const ClusteredArrayInvertedLists*>(ils)) {
+        // New logic for ClusteredArrayInvertedLists
+        uint32_t h = fourcc("clic"); // FourCC code for ClusteredArrayInvertedLists
+        WRITE1(h);
+        WRITE1(cails->nlist);
+        WRITE1(cails->code_size);
+
+        size_t n_non0 = 0;
+        for (size_t i = 0; i < cails->nlist; i++) {
+            if (cails->ids[i].size() > 0) n_non0++;
+        }
+
+        if (n_non0 > cails->nlist / 2) {
+            uint32_t list_type = fourcc("full");
+            WRITE1(list_type);
+            std::vector<size_t> sizes;
+            for (size_t i = 0; i < cails->nlist; i++) {
+                sizes.push_back(cails->ids[i].size());
+            }
+            WRITEVECTOR(sizes);
+        } else {
+            int list_type = fourcc("sprs");
+            WRITE1(list_type);
+            std::vector<size_t> sizes;
+            for (size_t i = 0; i < cails->nlist; i++) {
+                size_t n = cails->ids[i].size();
+                if (n > 0) {
+                    sizes.push_back(i);
+                    sizes.push_back(n);
+                }
+            }
+            WRITEVECTOR(sizes);
+        }
+
+        for (size_t i = 0; i < cails->nlist; i++) {
+            size_t n = cails->ids[i].size();
+            if (n > 0) {
+                WRITEANDCHECK(cails->codes[i].data(), n * cails->code_size);
+                WRITEANDCHECK(cails->ids[i].data(), n);
+                WRITEANDCHECK(cails->inlist_maps[i].data(), n);
+                // Writing inlist_maps for each non-empty list
+                //WRITEVECTOR(cails->inlist_maps[i].data());
+            }
+        }
+
+    }else if (
             const auto& ails = dynamic_cast<const ArrayInvertedLists*>(ils)) {
         uint32_t h = fourcc("ilar");
         WRITE1(h);
@@ -704,11 +750,14 @@ void write_index(const Index* idx, IOWriter* f, int io_flags) {
     } else if (const IndexIVFPQ* ivpq = dynamic_cast<const IndexIVFPQ*>(idx)) {
         const IndexIVFPQR* ivfpqr = dynamic_cast<const IndexIVFPQR*>(idx);
         const IndexIVFPQDisk* ivfpqd = dynamic_cast<const IndexIVFPQDisk*>(idx);
+        const IndexIVFPQDisk2* ivfpqd2 = dynamic_cast<const IndexIVFPQDisk2*>(idx);
         uint32_t h;
         if (ivfpqr) {
             h = fourcc("IwQR");
         } else if (ivfpqd) {
             h = fourcc("IwQD");
+        } else if (ivfpqd2) {
+            h = fourcc("IQD2");
         } else {
             h = fourcc("IwPQ");
         }
@@ -719,12 +768,14 @@ void write_index(const Index* idx, IOWriter* f, int io_flags) {
         WRITE1(ivpq->by_residual);
         WRITE1(ivpq->code_size);
         write_ProductQuantizer(&ivpq->pq, f);
-        write_InvertedLists(ivpq->invlists, f);
+        //write_InvertedLists(ivpq->invlists, f);
         if (ivfpqr) {
+            write_InvertedLists(ivpq->invlists, f);
             write_ProductQuantizer(&ivfpqr->refine_pq, f);
             WRITEVECTOR(ivfpqr->refine_codes);
             WRITE1(ivfpqr->k_factor);
         } else if (ivfpqd) {
+            write_InvertedLists(ivpq->invlists, f);
             size_t nlist = ivfpqd->nlist;
             for (size_t i = 0; i < nlist; ++i) {
                 WRITE1(ivfpqd->clusters[i]);
@@ -741,6 +792,65 @@ void write_index(const Index* idx, IOWriter* f, int io_flags) {
             size_t path_length = ivfpqd->disk_path.size();
             WRITE1(path_length); 
             WRITEANDCHECK(ivfpqd->disk_path.c_str(), path_length);
+            
+            if(ivfpqd->aligned_cluster_info){
+                for(size_t i = 0; i < nlist; i++){
+                    WRITE1(ivfpqd->aligned_cluster_info[i].page_start);
+                    WRITE1(ivfpqd->aligned_cluster_info[i].padding_offset);
+                    WRITE1(ivfpqd->aligned_cluster_info[i].page_count);
+                }
+            }
+            size_t value_type_length = ivfpqd->valueType.size();
+            WRITE1(value_type_length);
+            WRITEANDCHECK(ivfpqd->valueType.c_str(), value_type_length);
+        }  else if (ivfpqd2) {
+            // store invlist in other space if we want
+            size_t nlist = ivfpqd2->nlist;
+            WRITE1(ivfpqd2->select_lists);
+            if(ivfpqd2->select_lists){
+                WRITE1(ivpq->invlists->nlist);
+                WRITE1(ivpq->invlists->code_size);
+                size_t select_path_length = ivfpqd2->select_lists_path.size();
+                WRITE1(select_path_length); 
+                WRITEANDCHECK(ivfpqd2->select_lists_path.c_str(), select_path_length);
+                if(ivfpqd2->aligned_inv_info){
+                    for(size_t i = 0; i < nlist; ++i){
+                        WRITE1(ivfpqd2->aligned_inv_info[i].page_start);
+                        WRITE1(ivfpqd2->aligned_inv_info[i].padding_offset);
+                        WRITE1(ivfpqd2->aligned_inv_info[i].page_count);
+                        WRITE1(ivfpqd2->aligned_inv_info[i].list_size);
+                    }
+                }
+                 // store invlist in other space if we want
+            }else
+                write_InvertedLists(ivpq->invlists, f);
+
+            for (size_t i = 0; i < nlist; ++i) {
+                WRITE1(ivfpqd2->clusters[i]);
+            }
+            for (size_t i = 0; i < nlist; ++i) {
+                WRITE1(ivfpqd2->len[i]);
+            }
+            WRITE1(ivfpqd2->top);
+            WRITE1(ivfpqd2->estimate_factor);
+            WRITE1(ivfpqd2->estimate_factor_partial);
+            WRITE1(ivfpqd2->prune_factor);
+            WRITE1(ivfpqd2->disk_vector_offset);
+
+            size_t path_length = ivfpqd2->disk_path.size();
+            WRITE1(path_length); 
+            WRITEANDCHECK(ivfpqd2->disk_path.c_str(), path_length);
+            
+            if(ivfpqd2->aligned_cluster_info){
+                for(size_t i = 0; i < nlist; i++){
+                    WRITE1(ivfpqd2->aligned_cluster_info[i].page_start);
+                    WRITE1(ivfpqd2->aligned_cluster_info[i].padding_offset);
+                    WRITE1(ivfpqd2->aligned_cluster_info[i].page_count);
+                }
+            }
+            size_t value_type_length = ivfpqd2->valueType.size();
+            WRITE1(value_type_length);
+            WRITEANDCHECK(ivfpqd2->valueType.c_str(), value_type_length);
         }   
     } else if (
             auto* indep =

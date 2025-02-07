@@ -226,8 +226,7 @@ void IndexIVFPQ::add_core_o(
         void* inverted_list_context) {
     // printf("PQ add core here");
 
-    // idx_t num_centroids = assign_replicas;
-    idx_t num_centroids = 2;
+    idx_t num_centroids = assign_replicas;
     // std::cout<<num_centroids<<std::endl;
 
     idx_t bs = index_ivfpq_add_core_o_bs;
@@ -457,7 +456,9 @@ void initialize_IVFPQ_precomputed_table(
                     fvec_norm_L2sqr(pq.get_centroids(m, j), pq.dsub);
 
     if (use_precomputed_table == 1) {
-        precomputed_table.resize(nlist * pq.M * pq.ksub);
+        precomputed_table.resize(nlist * pq.M * pq.ksub);  
+        printf("precomputed_table.resize = %ld\n", nlist * pq.M * pq.ksub);
+        printf("nlist = %ld, pq.M = %ld, pq.ksub = %ld\n", nlist , pq.M , pq.ksub);
         std::vector<float> centroid(d);
 
         for (size_t i = 0; i < nlist; i++) {

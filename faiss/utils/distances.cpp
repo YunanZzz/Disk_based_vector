@@ -351,6 +351,68 @@ void exhaustive_L2sqr_blas(
     exhaustive_L2sqr_blas_default_impl(x, y, d, nx, ny, res);
 }
 
+void exhaustive_L2sqr_blas_single_query(
+        const float* x,
+        const float* y,
+        size_t d,
+        size_t ny,
+        float* res_dis,
+        const float* y_norms = nullptr) {
+    if (ny == 0)
+        return;
+
+    /* block size for y */
+    const size_t bs_y = distance_compute_blas_database_bs;
+    std::unique_ptr<float[]> ip_block(new float[bs_y]);
+    std::unique_ptr<float[]> del2;
+
+    // norm of single nx
+    float x_norm;
+    fvec_norms_L2sqr(&x_norm, x, d, 1);
+
+    // norm of ny
+    if (!y_norms) {
+        float* y_norms2 = new float[ny];
+        del2.reset(y_norms2);
+        fvec_norms_L2sqr(y_norms2, y, d, ny);
+        y_norms = y_norms2;
+    }
+
+    //res.begin_multiple(0, 1);  /
+
+    for (size_t j0 = 0; j0 < ny; j0 += bs_y) {
+        size_t j1 = j0 + bs_y;
+        if (j1 > ny)
+            j1 = ny;
+        {
+            float one = 1, zero = 0;
+            FINTEGER nyi = j1 - j0, nxi = 1,di = d;
+            sgemm_("Transpose",
+                   "Not transpose",
+                   &nyi,
+                   &nxi,
+                   &di,
+                   &one,
+                   y + j0 * d,
+                   &di,
+                   x,
+                   &di,
+                   &zero,
+                   ip_block.get(),
+                   &nyi);
+        }
+
+        for (size_t j = j0; j < j1; j++) {
+            float ip = ip_block[j - j0];
+            float dis = x_norm + y_norms[j] - 2 * ip;
+            if (dis < 0)
+                dis = 0;
+            res_dis[j] = dis;
+            //ip_block[j - j0] = dis;
+        }
+    }
+}
+
 #ifdef __AVX2__
 void exhaustive_L2sqr_blas_cmax_avx2(
         const float* x,

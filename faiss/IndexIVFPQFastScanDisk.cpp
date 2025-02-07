@@ -49,8 +49,8 @@ IndexIVFPQFastScanDisk::IndexIVFPQFastScanDisk(
           disk_path(diskPath),
           disk_vector_offset(d * sizeof(float)) {
     estimate_factor_partial = estimate_factor;
-    clusters = new size_t[nlist];
-    len = new size_t[nlist];
+    //clusters = new size_t[nlist];
+    //len = new size_t[nlist];
 }
 
 IndexIVFPQFastScanDisk::IndexIVFPQFastScanDisk(){}
@@ -60,73 +60,116 @@ IndexIVFPQFastScanDisk::~IndexIVFPQFastScanDisk() {
     delete[] len;
 }
 
-void IndexIVFPQFastScanDisk::initial_location(float* data) {
+void IndexIVFPQFastScanDisk::initial_location(idx_t n, const float* data) {
     if (!invlists) {
         throw std::runtime_error("invlists is not initialized.");
     }
 
-    // Cast invlists to BlockInvertedLists to access the underlying data
-    BlockInvertedLists* block_invlists =
-            dynamic_cast<BlockInvertedLists*>(invlists);
+    // Cast invlists to ArrayInvertedLists to access the underlying data
+    BlockInvertedLists* block_invlists = dynamic_cast<BlockInvertedLists*>(invlists);
     if (!block_invlists) {
         throw std::runtime_error("invlists is not of type BlockInvertedLists.");
     }
 
+    size_t* tmp_clusters = nullptr;
+    size_t* tmp_len = nullptr;
+    // the first time to add
+    if(clusters == nullptr && len == nullptr){
+        clusters = new size_t[nlist];
+        len = new size_t[nlist];
+    }else{
+        tmp_clusters = new size_t[nlist];
+        tmp_len = new size_t[nlist];
+        for(size_t i = 0; i < nlist; ++i){
+            tmp_clusters[i] = clusters[i];
+            tmp_len[i] = len[i];
+        }
+    }
+    
     size_t current_offset = 0;
     for (size_t i = 0; i < nlist; ++i) {
         clusters[i] = current_offset;
         len[i] = block_invlists->ids[i].size();
         current_offset += len[i];
     }
-    if (verbose) {
+    if(verbose){
         printf("Cluster info initialized!");
     }
     // reorg it at last, and save it to file.
-    reorganize_vectors(data);
+    reorganize_vectors(n, data, tmp_clusters ,tmp_len);
 }
 
 // Method to reorganize vectors based on clustering
-void IndexIVFPQFastScanDisk::reorganize_vectors(float* data) {
-    // if (!disk_data_read.is_open()) {
-    //     throw std::runtime_error("Disk read stream is not open.");
-    // }
-    //
-
-    //// Read all vectors into memory
-    // size_t total_size = ntotal * d * sizeof(float);
-    // std::unique_ptr<float[]> data(new float[ntotal * d]);
-    // disk_data_read.read(reinterpret_cast<char*>(data.get()), total_size);
-    // disk_data_read.close();
-
-    // Create a new disk path with ".clustered" suffix
-    std::string new_disk_path = disk_path + ".clustered";
-    disk_path = new_disk_path;
-    set_disk_write(new_disk_path);
-
-    // Cast invlists to ArrayInvertedLists to access the underlying data
-    BlockInvertedLists* block_invlists =
-            dynamic_cast<BlockInvertedLists*>(invlists);
+void IndexIVFPQFastScanDisk::reorganize_vectors(idx_t n, const float* data, size_t* old_clusters, size_t* old_len) {
+    
+    BlockInvertedLists* block_invlists = dynamic_cast<BlockInvertedLists*>(invlists);
     if (!block_invlists) {
         throw std::runtime_error("invlists is not of type BlockInvertedLists.");
     }
 
-    // Reorganize vectors and write to the new file
-    for (size_t i = 0; i < nlist; ++i) {
-        size_t offset = clusters[i];
-        size_t count = len[i];
-        for (size_t j = 0; j < count; ++j) {
-            idx_t id = block_invlists->ids[i][j];
-            const float* vector = &data[id * d];
-            disk_data_write.write(
-                    reinterpret_cast<const char*>(vector), d * sizeof(float));
+    idx_t old_total = this->ntotal - n;
+
+    if (old_clusters == nullptr && old_len == nullptr) {
+        // Reorganize vectors and write to the new file
+        disk_path = disk_path + ".clustered";
+
+        //std::cout << "disk_path_clustered: " << disk_path_clustered << std::endl;
+        //std::cout << "disk_path          : " << disk_path << std::endl;
+        set_disk_write(disk_path);
+        for (size_t i = 0; i < nlist; ++i) {
+            size_t count = len[i];
+            for (size_t j = 0; j < count; ++j) {
+                idx_t id = block_invlists->ids[i][j];
+                const float* vector = &data[id * d];
+                disk_data_write.write(reinterpret_cast<const char*>(vector), d * sizeof(float));
+            }
         }
+        disk_data_write.close();
+    } else {
+        std::string tmp_disk = disk_path + ".tmp";
+        // 1. Rename disk_path_clustered to tmp_disk
+        int file_result = std::rename(disk_path.c_str(), tmp_disk.c_str());
+        if(file_result == 0)
+            std::cout << "Success rename: " << tmp_disk << std::endl;
+        else
+            std::cout << "Fail: "<< tmp_disk << std::endl;
+        // 2. Open temp_disk for reading
+        std::ifstream temp_disk_read(tmp_disk, std::ios::binary);
+        if (!temp_disk_read.is_open()) {
+            throw std::runtime_error("Failed to open temporary disk file for reading.");
+        }
+
+        // 3. Set up for writing to the new clustered disk path
+        set_disk_write(disk_path);
+        
+        // 4. Write old data and new data to the file
+        for (size_t i = 0; i < nlist; ++i) {
+            size_t old_offset = old_clusters[i];
+            size_t old_count = old_len[i];
+
+            // Read old cluster data
+            std::vector<float> old_cluster(old_count * d);
+            temp_disk_read.seekg(old_offset * d * sizeof(float), std::ios::beg);
+            temp_disk_read.read(reinterpret_cast<char*>(old_cluster.data()), old_count * d * sizeof(float));
+            disk_data_write.write(reinterpret_cast<const char*>(old_cluster.data()), old_count * d * sizeof(float));
+
+            // Write new data
+            size_t count = len[i];
+            for (size_t j = old_count; j < count; ++j) {
+                idx_t id = block_invlists->ids[i][j];
+                const float* vector = &data[(id - old_total) * d];
+                disk_data_write.write(reinterpret_cast<const char*>(vector), d * sizeof(float));
+            }
+        }
+        disk_data_write.close();
+        temp_disk_read.close();
+
+        // 5. Delete the temporary file
+        std::remove(tmp_disk.c_str());
     }
 
-    disk_data_write.close();
-
     if (verbose) {
-        printf("Vectors reorganized and written to %s\n",
-               new_disk_path.c_str());
+        printf("Vectors reorganized and written to %s\n", disk_path.c_str());
     }
 }
 
@@ -199,6 +242,12 @@ void IndexIVFPQFastScanDisk::load_clusters(
     if (disk_data_read.fail()) {
         throw std::runtime_error("Failed to read vectors from disk.");
     }
+}
+
+
+void IndexIVFPQFastScanDisk::add(idx_t n, const float* x){
+    add_with_ids(n, x, nullptr);
+    initial_location(n, x);
 }
 
 /*-----------------------modified from IVFPQFastScan---------------------------*/
@@ -346,8 +395,6 @@ void IndexIVFPQFastScanDisk::search_dispatch_implem(
     }
 
     idx_t k = k_r * this->assign_replicas;
-    // k=800;
-    printf("ivfpqfs::k=%d\n",k);
     std::unique_ptr<idx_t[]> del1(new idx_t[n * k]);
     std::unique_ptr<float[]> del2(new float[n * k]);
     idx_t* labels = del1.get();
@@ -455,79 +502,79 @@ bool skip_replica(int k, idx_t id, idx_t* ids){
     return false;
 }
 
-// template <class C>
-// void disk_rerank(
-//         std::ifstream& disk_data,
-//         int k,
-//         size_t cluster_begin,
-//         size_t len,
-//         size_t single_offset,
-//         int D,
-//         float factor,
-//         float factor_partial,
-//         const float* query,
-//         float* list_sim,
-//         idx_t* list_ids,
-//         float* heap_sim,
-//         idx_t* heap_ids,
-//         const idx_t* id_map,
-//         Load_Strategy load_strategy) {
-//     KnnSearchResults<C> res(k, heap_sim, heap_ids);  // ?
-//     auto time_start = std::chrono::high_resolution_clock::now();      // time begin
-//     if (load_strategy == FULLY) {
-//         std::vector<float> vec(D * len);
-//         size_t offset = cluster_begin * single_offset;
-//         disk_data.seekg(offset, std::ios::beg);
-//         disk_data.read(reinterpret_cast<char*>(vec.data()), D * len * sizeof(float));
-//         float* cluster_data = vec.data();
+template <class C>
+void disk_rerank(
+        std::ifstream& disk_data,
+        int k,
+        size_t cluster_begin,
+        size_t len,
+        size_t single_offset,
+        int D,
+        float factor,
+        float factor_partial,
+        const float* query,
+        float* list_sim,
+        idx_t* list_ids,
+        float* heap_sim,
+        idx_t* heap_ids,
+        const idx_t* id_map,
+        Load_Strategy load_strategy) {
+    KnnSearchResults<C> res(k, heap_sim, heap_ids);  // ?
+    auto time_start = std::chrono::high_resolution_clock::now();      // time begin
+    if (load_strategy == FULLY) {
+        std::vector<float> vec(D * len);
+        size_t offset = cluster_begin * single_offset;
+        disk_data.seekg(offset, std::ios::beg);
+        disk_data.read(reinterpret_cast<char*>(vec.data()), D * len * sizeof(float));
+        float* cluster_data = vec.data();
 
-//         auto time_end = std::chrono::high_resolution_clock::now();       // time end
-//         indexIVFPQFastScanDisk_stats.disk_full_elapsed += time_end - time_start;
-//         time_start = std::chrono::high_resolution_clock::now();      // time begin
+        auto time_end = std::chrono::high_resolution_clock::now();       // time end
+        indexIVFPQFastScanDisk_stats.disk_full_elapsed += time_end - time_start;
+        time_start = std::chrono::high_resolution_clock::now();      // time begin
 
-//         for (size_t i = 0; i < len; i++) {
+        for (size_t i = 0; i < len; i++) {
  
-//             if (list_sim[i] < heap_sim[0] * factor) {
-//                 float distance =
-//                         fvec_L2sqr(query, cluster_data + list_ids[i] * D, D);
-//                 res.add(id_map[list_ids[i]], distance);
-//                 indexIVFPQFastScanDisk_stats.full_cluster_rerank++;
-//             }
-//             indexIVFPQFastScanDisk_stats.full_cluster_compare++;
-//         }
+            if (list_sim[i] < heap_sim[0] * factor) {
+                float distance =
+                        fvec_L2sqr(query, cluster_data + list_ids[i] * D, D);
+                res.add(id_map[list_ids[i]], distance);
+                indexIVFPQFastScanDisk_stats.full_cluster_rerank++;
+            }
+            indexIVFPQFastScanDisk_stats.full_cluster_compare++;
+        }
 
-//         time_end = std::chrono::high_resolution_clock::now();       // time end
-//         indexIVFPQFastScanDisk_stats.memory_2_elapsed += time_end - time_start;
+        time_end = std::chrono::high_resolution_clock::now();       // time end
+        indexIVFPQFastScanDisk_stats.memory_2_elapsed += time_end - time_start;
 
-//     } else {
-//         std::vector<float> vec(D);
-//         size_t offset = cluster_begin * single_offset;
-//         auto time_end = std::chrono::high_resolution_clock::now();       // time end
-//         for (size_t i = 0; i < len; i++) {            
-//             if (list_sim[i] < heap_sim[0] * factor_partial) {
+    } else {
+        std::vector<float> vec(D);
+        size_t offset = cluster_begin * single_offset;
+        auto time_end = std::chrono::high_resolution_clock::now();       // time end
+        for (size_t i = 0; i < len; i++) {            
+            if (list_sim[i] < heap_sim[0] * factor_partial) {
 
-//                 time_start = std::chrono::high_resolution_clock::now();      // time begin
+                time_start = std::chrono::high_resolution_clock::now();      // time begin
 
-//                 disk_data.seekg(offset, std::ios::beg);
-//                 disk_data.seekg(list_ids[i] * single_offset, std::ios::cur);
-//                 disk_data.read(reinterpret_cast<char*>(vec.data()), D * sizeof(float));
+                disk_data.seekg(offset, std::ios::beg);
+                disk_data.seekg(list_ids[i] * single_offset, std::ios::cur);
+                disk_data.read(reinterpret_cast<char*>(vec.data()), D * sizeof(float));
 
-//                 time_end = std::chrono::high_resolution_clock::now(); // time end
-//                 indexIVFPQFastScanDisk_stats.disk_partial_elapsed += time_end - time_start;
-//                 time_start = std::chrono::high_resolution_clock::now();      // time begin
+                time_end = std::chrono::high_resolution_clock::now(); // time end
+                indexIVFPQFastScanDisk_stats.disk_partial_elapsed += time_end - time_start;
+                time_start = std::chrono::high_resolution_clock::now();      // time begin
 
-//                 float distance = fvec_L2sqr(query, vec.data(), D);
-//                 res.add(id_map[list_ids[i]], distance);
-//                 indexIVFPQFastScanDisk_stats.partial_cluster_rerank++;
+                float distance = fvec_L2sqr(query, vec.data(), D);
+                res.add(id_map[list_ids[i]], distance);
+                indexIVFPQFastScanDisk_stats.partial_cluster_rerank++;
 
-//                 time_end = std::chrono::high_resolution_clock::now(); // time end
-//                 indexIVFPQFastScanDisk_stats.memory_2_elapsed += time_end - time_start;
-//             }
+                time_end = std::chrono::high_resolution_clock::now(); // time end
+                indexIVFPQFastScanDisk_stats.memory_2_elapsed += time_end - time_start;
+            }
 
-//             indexIVFPQFastScanDisk_stats.partial_cluster_compare++;
-//         }
-//     }
-// }
+            indexIVFPQFastScanDisk_stats.partial_cluster_compare++;
+        }
+    }
+}
 
 template <class C>
 void disk_rerank(
@@ -551,9 +598,7 @@ void disk_rerank(
     if (load_strategy == FULLY) {
         std::vector<float> vec(D * len);
         size_t offset = cluster_begin * single_offset;
-        if (fseek(disk_data, offset, SEEK_SET) != 0) {
-                    throw std::runtime_error("Failed to seek in disk file");
-                }
+        fseek(disk_data, offset, SEEK_SET); 
         fread(vec.data(), sizeof(float), D * len, disk_data); 
         float* cluster_data = vec.data();
         auto time_end = std::chrono::high_resolution_clock::now(); // time end
@@ -562,7 +607,7 @@ void disk_rerank(
         time_start = std::chrono::high_resolution_clock::now(); // time begin
         for (size_t i = 0; i < len; i++) {
             if (list_sim[i] < heap_sim[0] * factor) {
-                float distance = fvec_L2sqr(query, cluster_data + list_ids[i] * D, D);
+                float distance = fvec_L2sqr_simd(query, cluster_data + list_ids[i] * D, D);
                 res.add(id_map[list_ids[i]], distance);
                 indexIVFPQFastScanDisk_stats.full_cluster_rerank++;
             }
@@ -587,7 +632,7 @@ void disk_rerank(
                 indexIVFPQFastScanDisk_stats.disk_partial_elapsed += time_end - time_start;
                 
                 time_start = std::chrono::high_resolution_clock::now(); // time begin
-                float distance = fvec_L2sqr(query, vec.data(), D);
+                float distance = fvec_L2sqr_simd(query, vec.data(), D);
                 res.add(id_map[list_ids[i]], distance);
                 indexIVFPQFastScanDisk_stats.partial_cluster_rerank++;
                 time_end = std::chrono::high_resolution_clock::now(); // time end

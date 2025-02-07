@@ -9,9 +9,9 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <chrono>
 
 namespace faiss {
+
 /// Returns the distance to a single code.
 template <typename PQDecoderT>
 inline float distance_single_code_generic(

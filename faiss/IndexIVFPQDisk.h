@@ -4,16 +4,16 @@
 #include <vector>
 
 #include <faiss/IndexIVFPQ.h>
+#include <faiss/IndexHNSW.h>
 #include <faiss/impl/platform_macros.h>
 #include <faiss/utils/AlignedTable.h>
+#include <faiss/impl/DiskInvertedListHolder.h>
+#include <faiss/impl/DiskIOProcessor.h>
 
 #include <string>
 #include <fstream>   
 
 #include <chrono>
-#include <faiss/IndexHNSW.h>
-#include <faiss/index_io.h>
-#include <iostream>
 using namespace std::chrono;
 
 
@@ -32,13 +32,14 @@ public:
             float estimate_factor,
             float prune_factor,
             const std::string& diskPath,
+            const std::string& valueType = "float",
             MetricType metric = METRIC_L2);
     
     IndexIVFPQDisk();
 
     ~IndexIVFPQDisk();
 
-    virtual void adjustReplica(idx_t n, idx_t k, idx_t* label, float* distances) const;
+
     void set_disk_read(const std::string& diskPath); // Method to set the disk path and open read stream
 
     void set_disk_write(const std::string& diskPath);  // Method to set the disk path and open write stream
@@ -47,23 +48,6 @@ public:
                              // can put it in some other functions. But I'd
                              // prefer to explicitly calling it now. Must call it before search.
     void reorganize_vectors(idx_t n, const float* data, size_t* old_clusters,size_t* old_len);
-    void load_hnsw_centroid_index() {
-        if (centroid_index_path.empty()) {
-            throw std::runtime_error("Centroid index path is not set.");
-        }
-        // Load the HNSW index from the specified path
-        faiss::Index* loaded_index = faiss::read_index(centroid_index_path.c_str());
-
-        // Attempt to cast the loaded index to faiss::IndexHNSW
-        centroid_index = dynamic_cast<faiss::IndexHNSWFlat*>(loaded_index);
-
-        if (centroid_index == nullptr) {
-            throw std::runtime_error("Failed to cast the loaded index to faiss::IndexHNSW.");
-        }
-
-        std::cout << "HNSW centroid index loaded successfully from " << centroid_index_path << std::endl;
-    }
-
 
     void load_from_offset(
             size_t list_no,
@@ -131,6 +115,19 @@ public:
         this->prune_factor = prune_factor;
     }
 
+    void set_centroid_index_path(const std::string& centroid_path) {
+        centroid_index_path = centroid_path;
+    }
+
+    template<typename ValueType>
+    void set_value_type(){
+
+    }
+
+    void train_graph() override;
+
+    void load_hnsw_centroid_index();
+
     void add_with_ids(idx_t n, const float* x, const idx_t* xids) override;
 
     void add_core(
@@ -164,8 +161,30 @@ public:
             bool store_pairs,
             const IDSelector* sel) const override;
 
+    DiskIOProcessor* get_DiskIOBuildProcessor();
+
+    DiskIOProcessor* get_DiskIOSearchProcessor() const;
+
+    // warm up according to vectors
+    int warm_up_nvec(size_t n, float* x, size_t w_nprobe, size_t nvec);
+
+    // warm up according to nlist
+    int warm_up_nlist(size_t n, float* x, size_t w_nprobe, size_t nlist);
+
+    size_t get_code_size(){
+        if(valueType == "float"){
+            return d*sizeof(float);
+        }else if(valueType == "uint8_t"){
+            return d*sizeof(uint8_t);
+        }else{
+            FAISS_THROW_MSG("get_code_size() only support float & uint8_t");
+            return 0;
+        }
+    }
+
 
 //private:
+// search parameters
     // 1. array to help locate where is the vector in disk. (File is reorganized
     // by clusters)
     size_t* clusters;     // ith cluster begin at clusters[i]
@@ -175,14 +194,28 @@ public:
     float estimate_factor_partial;   // usually same with estimate_factor
     float prune_factor;              // prune some lists
     size_t disk_vector_offset;
-    
 
+    DiskInvertedListHolder diskInvertedListHolder;
+
+    Aligned_Cluster_Info* aligned_cluster_info;
+    
+// build parameters
     // 2. disk operations
+    size_t add_batch_num = 1;    // add a big file in batchs
+    size_t actual_batch_num = 0;  // temperory varible..... delete it later
+
     std::string disk_path;
     //std::string disk_path_clustered;
     std::ifstream disk_data_read;
     std::ofstream disk_data_write;
+
+    // 3. extra graph index
+    std::string centroid_index_path;
     faiss::IndexHNSWFlat* centroid_index = nullptr;
+
+    // 4. value type, must set when constructing
+    std::string valueType;
+
 };
 
 struct IndexIVFPQDiskStats {
@@ -197,6 +230,14 @@ struct IndexIVFPQDiskStats {
     size_t partial_cluster_rerank;
     ///< rerank times in PARTIAL load strategy
 
+    size_t cached_list_access;
+
+    size_t searched_vector_full;
+    size_t searched_vector_partial;
+
+    size_t searched_page_full;
+    size_t searched_page_partial;
+
     std::chrono::duration<double, std::micro> memory_1_elapsed;
     std::chrono::duration<double, std::micro> memory_2_elapsed;
     std::chrono::duration<double, std::micro> disk_full_elapsed;
@@ -204,9 +245,6 @@ struct IndexIVFPQDiskStats {
     std::chrono::duration<double, std::micro> others_elapsed;
     std::chrono::duration<double, std::micro> coarse_elapsed;
     std::chrono::duration<double, std::micro> rank_elapsed;
-    std::chrono::duration<double, std::micro> PQ_four_code1;
-    std::chrono::duration<double, std::micro> PQ_four_code2;
-    std::chrono::duration<double, std::micro> PQ_four_code;
     size_t pruned;
 
     IndexIVFPQDiskStats() {

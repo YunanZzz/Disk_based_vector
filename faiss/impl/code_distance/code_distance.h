@@ -61,7 +61,7 @@ inline void distance_four_codes(
         float& result1,
         float& result2,
         float& result3) {
-    distance_four_codes_generic<PQDecoderT>(
+    distance_four_codes_avx2<PQDecoderT>(
             M,
             nbits,
             sim_table,

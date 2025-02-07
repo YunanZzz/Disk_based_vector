@@ -414,6 +414,7 @@ struct HeapHandler : ResultHandlerCompare<C, with_id_map> {
     }
 };
 
+
 /** Special version for facilitating get whole result from a cluster */
 /** One query and one cluster */
 template <class C, bool with_id_map = false>
@@ -528,6 +529,7 @@ struct SingleQueryResultHandler : ResultHandlerCompare<C, with_id_map> {
         }
     }
 };
+
 
 /** Simple top-N implementation using a reservoir.
  *

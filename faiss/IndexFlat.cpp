@@ -8,7 +8,7 @@
 // -*- c++ -*-
 
 #include <faiss/IndexFlat.h>
-#include <faiss/IndexHNSW.h>
+
 #include <faiss/impl/AuxIndexStructures.h>
 #include <faiss/impl/FaissAssert.h>
 #include <faiss/utils/Heap.h>
@@ -18,7 +18,6 @@
 #include <faiss/utils/sorting.h>
 #include <faiss/utils/utils.h>
 #include <cstring>
-#include <faiss/index_io.h>
 
 namespace faiss {
 
@@ -41,22 +40,7 @@ void IndexFlat::search(
         knn_inner_product(x, get_xb(), d, n, ntotal, &res, sel);
     } else if (metric_type == METRIC_L2) {
         float_maxheap_array_t res = {size_t(n), size_t(k), labels, distances};
-        // knn_L2sqr(x, get_xb(), d, n, ntotal, &res, nullptr, sel);
-        if (n < 100000) {
-            printf("IndexFlat::search::knn_L2sqr, n=%ld, k=%ld \n",n, k);
-            knn_L2sqr(x, get_xb(), d, n, ntotal, &res, nullptr, sel);
-        } else {
-            printf("IndexFlat::search::hnsw way, n=%ld, k=%ld \n",n, k);
-            faiss::IndexHNSWFlat index(d, 16);
-            index.add(ntotal, get_xb());
-            // printf("IndexFlat::search::knn_L2sqr::hnsw way created \n");
-            // faiss::write_index(&index, "centroid_index");
-            index.hnsw.efSearch=400;
-            // printf("IndexFlat::search::knn_L2sqr::hnsw way start searching \n");
-            index.search(n, x, k, distances, labels);
-            printf("IndexFlat::search::hnsw way done \n");
-            return;
-        }
+        knn_L2sqr(x, get_xb(), d, n, ntotal, &res, nullptr, sel);
     } else {
         FAISS_THROW_IF_NOT(!sel); // TODO implement with selector
         knn_extra_metrics(

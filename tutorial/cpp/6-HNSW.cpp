@@ -16,6 +16,7 @@
 #include <iostream>
 #include <map>
 #include <random>
+#include <omp.h>
 
 using idx_t = faiss::idx_t;
 double elapsed() {
@@ -62,10 +63,9 @@ int main() {
     int d = 128;      // dimension
     int nb = 1000000; // database size
     int nq = 10000;   // nb of queries
-    char* base_filepath =
-            "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_base.fvecs";
-    char* query_filepath =
-            "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_query.fvecs";
+    char* base_filepath = "/mnt/d/VectorDB/sift/sift/sift_base.fvecs";
+    char* query_filepath = "/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
+    char* groundtruth_filepath = "/mnt/d/VectorDB/sift/sift/sift_groundtruth.ivecs";
     size_t dd; // dimension
     size_t nt; // the number of vectors
     float* xb = new float[d * nb];
@@ -75,6 +75,7 @@ int main() {
     size_t nt2; // the number of query
     xb = fvecs_read(base_filepath, &dd, &nt);
     xq = fvecs_read(query_filepath, &dd2, &nt2);
+    
 
     {
         srand((int)time(0));
@@ -95,25 +96,25 @@ int main() {
         size_t nq2;
         size_t kk;
         int* gt_int = ivecs_read(
-                "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_groundtruth.ivecs",
+                groundtruth_filepath,
                 &kk,
                 &nq2);
-    omp_set_num_threads(16);
     int m=16;
     faiss::IndexHNSWFlat index(d,m,faiss::METRIC_L2);
             index.hnsw.efConstruction=40;
         index.metric_type = faiss::METRIC_L2;
-        assert(!index.is_trained);
-        // printf("[%.3f s] hnsw start to train\n", elapsed() - t0);
-        // index.train(nb / 100, trainvecs.data());
-        // printf("[%.3f s] hnsw train finished\n", elapsed() - t0);
-        // assert(index.is_trained);
+        //assert(!index.is_trained);
+        printf("[%.3f s] hnsw start to train\n", elapsed() - t0);
+        index.train(nb / 100, trainvecs.data());
+        printf("[%.3f s] hnsw train finished\n", elapsed() - t0);
+        //assert(index.is_trained);
         printf("[%.3f s] hnsw start to add\n", elapsed() - t0);
         index.add(nb, xb);
         // write_index(&index, "large.index");
         printf("[%.3f s] hnsw add finished\n", elapsed() - t0);
         std::vector<double> search_times;
         std::vector<double> recalls;
+        omp_set_num_threads(1);
         { // search xq
             idx_t* I = new idx_t[k * nq];
             float* D = new float[k * nq];
@@ -131,8 +132,7 @@ int main() {
             // }
             // int arr[] = {3,5,7,10,20,30,35,45};
             // int arr[] = {3, 5, 7, 10, 20, 30, 40, 50, 60};
-            //  int arr[] = {100, 200, 300, 400, 500,600,700,800};
-            int arr[] = {200};
+             int arr[] = {100, 200, 300, 400, 500,600,700,800};
             // how to get length of array
             for (int i : arr) {
                 // print current i
@@ -140,14 +140,13 @@ int main() {
                 index.hnsw.efSearch = i;
                 printf("[%.3f s] hnsw start to search\n", elapsed() - t0);
                 double t1 = elapsed();
-                // index.search(nq, xq, k, D, I);
-                // iterative query
-                 for (int i = 0; i < nq; i+=625) {
-                     index.search(625, xq + i * d, k, D + i * k, I + i * k);
-                 }
+                index.search(nq, xq, k, D, I);
                 double t2 = elapsed();
                 double search_time = t2 - t1;
-
+                // iterative query
+                //  for (int i = 0; i < nq; i++) {
+                //      index.search(1, xq + i * d, k, D + i * k, I + i * k);
+                //  }
                 printf("[%.3f s] hnsw search finished\n", elapsed() - t0);
 
                 // evaluate result
@@ -199,6 +198,15 @@ int main() {
         for (size_t i = 0; i < search_times.size(); i++) {
             std::cout << search_times[i];
             if (i < search_times.size() - 1) {
+                std::cout << ", ";
+            }
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "QPS: [";
+        for (size_t i = 0; i < recalls.size(); i++) {
+            std::cout << 1000.0/search_times[i];
+            if (i < recalls.size() - 1) {
                 std::cout << ", ";
             }
         }

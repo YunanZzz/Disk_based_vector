@@ -63,10 +63,9 @@ int main() {
     int d = 128;      // dimension
     int nb = 1000000; // database size
     int nq = 10000;   // nb of queries
-    char* base_filepath =
-            "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_base.fvecs";
-    char* query_filepath =
-            "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_query.fvecs";
+    char* base_filepath = "/mnt/d/VectorDB/sift/sift/sift_base.fvecs";
+    char* query_filepath = "/mnt/d/VectorDB/sift/sift/sift_query.fvecs";
+    char* groundtruth_filepath = "/mnt/d/VectorDB/sift/sift/sift_groundtruth.ivecs";
     size_t dd; // dimension
     size_t nt; // the number of vectors
     float* xb = new float[d * nb];
@@ -90,14 +89,13 @@ int main() {
                 trainvecs[d * i + j] = xb[rng * d + j];
             }
         }
-        omp_set_num_threads(1);
         int nlist = 1000;
         int k = 100;
         // load ground-truth and convert int to long
         size_t nq2;
         size_t kk;
         int* gt_int = ivecs_read(
-                "/home/zhan4404/costeff/diskann/DiskANN/build/data/sift/sift_groundtruth.ivecs",
+                groundtruth_filepath,
                 &kk,
                 &nq2);
         faiss::IndexFlatL2 quantizer(d); // the other index
@@ -115,6 +113,7 @@ int main() {
         printf("[%.3f s] ivfflat add finished\n", elapsed() - t0);
         std::vector<double> search_times;
         std::vector<double> recalls;
+        omp_set_num_threads(1);
         { // search xq
             idx_t* I = new idx_t[k * nq];
             float* D = new float[k * nq];
@@ -131,8 +130,8 @@ int main() {
             //     printf("\n");
             // }
             // int arr[] = {3,5,7,10,20,30,35,45};
-            int arr[] = {3, 5, 7, 10, 15, 20, 40, 60, 80};
-
+             int arr[] = {3, 5, 7, 10, 20, 30, 40, 50, 60};
+            //int arr[] = {3, 5, 7, 10, 15, 20};
             // how to get length of array
             for (int i : arr) {
                 // print current i
@@ -198,6 +197,15 @@ int main() {
         for (size_t i = 0; i < search_times.size(); i++) {
             std::cout << search_times[i];
             if (i < search_times.size() - 1) {
+                std::cout << ", ";
+            }
+        }
+        std::cout << "]" << std::endl;
+
+        std::cout << "QPS: [";
+        for (size_t i = 0; i < recalls.size(); i++) {
+            std::cout << 1000.0/search_times[i];
+            if (i < recalls.size() - 1) {
                 std::cout << ", ";
             }
         }

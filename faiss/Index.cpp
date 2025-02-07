@@ -15,7 +15,6 @@
 #include <faiss/utils/distances.h>
 
 #include <cstring>
-#include <iostream>
 
 namespace faiss {
 
@@ -37,7 +36,6 @@ void Index::range_search(
 void Index::assign(idx_t n, const float* x, idx_t* labels, idx_t k) const {
     std::vector<float> distances(n * k);
     search(n, x, k, distances.data(), labels);
-    printf("Index::assign::k=%d\n",k);
     if (k != 1) {
         adjustReplica(n, k, labels, distances.data());
     }
@@ -46,7 +44,6 @@ void Index::assign(idx_t n, const float* x, idx_t* labels, idx_t k) const {
 
 void Index::adjustReplica(idx_t n, idx_t k, idx_t* label, float* distances)
         const {
-            int count=0;
 #pragma omp parallel for
     for (size_t i = 0; i < n; i++) {
         float tmp = distances[i * k]; // Start with the first distance in the row
@@ -59,13 +56,11 @@ void Index::adjustReplica(idx_t n, idx_t k, idx_t* label, float* distances)
             } else {
                 for (size_t l = j; l < k; l++) {
                     label[i * k + l] = -1; // Assign -1 to label
-                    count++;
                 }
                 break;
             }
         }
     }
-    printf("count=%d\n",count);
 }
 
 void Index::add_with_ids(
